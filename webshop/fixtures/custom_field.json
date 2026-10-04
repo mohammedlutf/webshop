@@ -1,0 +1,26 @@
+[
+
+    {
+    "doctype": "Custom Field",
+    "name" :"Address delivery-rate-charges",
+    "dt": "Address",
+    "fieldname": "delivery_rate_charges",
+    "fieldtype": "Currency",
+    "label": "Delivery Rate Charges",
+    "insert_after": "tax_category",
+    "default": "0"
+},
+
+{
+    "doctype": "Custom Field",
+    "name" :"Item Group website-ranking",
+    "dt": "Item Group",
+    "fieldname": "website_ranking",
+    "fieldtype": "Int",
+    "label": "Website Rank",
+    "insert_after": "custom_company",
+    "default": "0",
+    "description" : "Group with higher ranking will be shown higher"
+}
+
+]

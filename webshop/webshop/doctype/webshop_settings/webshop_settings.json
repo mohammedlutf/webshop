@@ -15,6 +15,7 @@
   "hide_variants",
   "enable_variants",
   "show_price",
+  "hide_product_with_zero_rate",
   "column_break_9",
   "login_required_to_view_products",
   "show_stock_availability",
@@ -415,12 +416,18 @@
    "fieldtype": "Table",
    "label": "admin users",
    "options": "webshop admin users"
+  },
+  {
+   "default": "0",
+   "fieldname": "hide_product_with_zero_rate",
+   "fieldtype": "Check",
+   "label": "Hide products with zero rate"
   }
  ],
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-09-30 18:53:22.739134",
+ "modified": "2026-10-03 20:56:38.287132",
  "modified_by": "Administrator",
  "module": "Webshop",
  "name": "Webshop Settings",
