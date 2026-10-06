@@ -18,7 +18,7 @@
     "fieldname": "website_ranking",
     "fieldtype": "Int",
     "label": "Website Rank",
-    "insert_after": "custom_company",
+    "insert_after": "is_group",
     "default": "0",
     "description" : "Group with higher ranking will be shown higher"
 }
