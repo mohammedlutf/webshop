@@ -585,7 +585,7 @@ def _reference_data():
 		"price_list": settings.price_list,
 		"company": company,
 		"currency": frappe.db.get_value("Company", company, "default_currency") if company else "YER",
-		"website_warehouse": "مخازن - ن",
+		"website_warehouse": frappe.db.get_single_value("Stock Settings", "default_warehouse"),
 	}
 
 
