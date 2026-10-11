@@ -255,12 +255,15 @@ def _catalog_filters(item_group=None, search=None):
 	or_filters = None
 	if item_group:
 		filters["item_group"] = item_group
-	search_terms = [term.strip() for term in (search or "").split() if term.strip()]
+
+	
+	# search_terms = [term.strip() for term in (search or "").split() if term.strip()]
+	search_terms = search
 	if search_terms:
 		search_fields = ["web_item_name", "item_name", "item_code", "description", "short_description"]
 		or_filters = [
-			{field: ["like", f"%{term}%"]}
-			for term in search_terms
+			{field: ["like", f"%{search_terms}%"]}
+			# for term in search_terms
 			for field in search_fields
 		]
 
@@ -274,6 +277,8 @@ def _catalog_filters(item_group=None, search=None):
 			filters["item_code"] = ["not in", zero_rate]
 
 	return filters, or_filters
+
+
 
 
 def get_catalog(item_group=None, search=None, limit=24, start=0):
