@@ -26,6 +26,7 @@
   "website_image_alt",
   "column_break_13",
   "slideshow",
+  "blurhash",
   "thumbnail",
   "stock_information_section",
   "website_warehouse",
@@ -340,6 +341,13 @@
    "fieldname": "on_backorder",
    "fieldtype": "Check",
    "label": "On Backorder"
+  },
+  {
+   "description": "blurhash string used as the storefront image placeholder",
+   "fieldname": "blurhash",
+   "fieldtype": "Small Text",
+   "label": "Blurhash Placeholder",
+   "read_only": 1
   }
  ],
  "has_web_view": 1,
@@ -347,11 +355,11 @@
  "index_web_pages_for_search": 1,
  "links": [],
  "make_attachments_public": 1,
- "modified": "2024-11-05 13:41:45.347700",
+ "modified": "2026-10-12 18:41:21.667504",
  "modified_by": "Administrator",
  "module": "Webshop",
  "name": "Website Item",
- "naming_rule": "Expression (old style)",
+ "naming_rule": "Expression",
  "owner": "Administrator",
  "permissions": [
   {
@@ -403,6 +411,7 @@
    "write": 1
   }
  ],
+ "row_format": "Dynamic",
  "search_fields": "web_item_name, item_code, item_group",
  "show_name_in_global_search": 1,
  "sort_field": "modified",

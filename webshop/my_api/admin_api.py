@@ -15,19 +15,33 @@ only caller and encodes with `JSON.stringify` for the same reason.
 import base64
 import io
 import json
+import re
 
 import frappe
 from frappe import _
 from frappe.utils import cint, flt, strip_html
-import re
-from webshop.my_api.api import _get_calculated_uoms, _settings
+from frappe.utils.file_manager import save_file
 from frappe.utils.password import update_password
+
+from webshop.my_api.api import _get_calculated_uoms, _settings
+
+try:
+	import blurhash
+	from PIL import Image, ImageOps
+	import numpy as np
+except Exception:
+	blurhash = None
+	ImageOps = None
 
 # Mirrors the storefront's own rule, so an item in a hidden group keeps behaving
 # the way the website behaves.
 MAX_IMAGE_EDGE = 800
 IMAGE_QUALITY = 75
 MAX_RAW_IMAGE_BYTES = 15 * 1024 * 1024
+# A few kilobytes of crafted image data can decode to an enormous bitmap (a
+# "decompression bomb"). Cap the decoded pixel count so a malformed upload is
+# rejected instead of exhausting the worker's memory.
+MAX_IMAGE_PIXELS = 40 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -45,34 +59,75 @@ def slugify(text):
 
 
 
-@frappe.whitelist(allow_guest=True)
+def _throttle_registration(phone, limit=10, window=60 * 60):
+	"""Limit sign-up attempts per phone number.
+
+	This is the one endpoint an unauthenticated caller can hammer, so it is
+	counted in the shared cache, which keeps the limit effective across worker
+	processes and restarts.
+	"""
+	key = "ecommerce:register:{}".format(phone)
+	attempts = cint(frappe.cache().get_value(key) or 0)
+	if attempts >= limit:
+		frappe.throw(_("Too many sign-up attempts for this number. Please try again later."))
+	frappe.cache().set_value(key, attempts + 1, expires_in_sec=window)
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
 def register_user_by_phone(phone, full_name, new_password):
-    generatedEmail = f"{phone}@yemen.local"
-    
-    # Check if user already exists by email or mobile number
-    if frappe.db.exists("User", generatedEmail) or frappe.db.exists("User", {"mobile_no": phone}):
-        return {"status": "error", "message": "هذا الحساب مسجل مسبقاً، يرجى تسجيل الدخول مباشرة."}
-    
-    try:
-        # Create the user document
-        user = frappe.get_doc({
-            "doctype": "User",
-            "email": generatedEmail,
-            "first_name": full_name,
-            "mobile_no": phone,
-            "user_type": "Website User",
-            "enabled": 1,
-            "send_welcome_email": 0
-        })
-        user.insert(ignore_permissions=True)
-        
-        # Set the password
-        update_password(generatedEmail, new_password)
-        
-        return {"status": "success", "message": "تم إنشاء الحساب بنجاح!"}
-    
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+	"""Create a website user from a phone number.
+
+	Guest-accessible by necessity — this *is* the sign-up — so every input is
+	validated here rather than trusted, repeat attempts are throttled, and the
+	response never carries an internal exception string back to the caller.
+	"""
+	phone = re.sub(r"[^\d]", "", str(phone or ""))
+	if not re.fullmatch(r"\d{7,15}", phone):
+		return {"status": "error", "message": "رقم الهاتف غير صالح"}
+
+	full_name = strip_html((full_name or "").strip())[:140]
+	if not full_name:
+		return {"status": "error", "message": "الرجاء إدخال الاسم"}
+
+	if not isinstance(new_password, str) or len(new_password) < 6:
+		return {"status": "error", "message": "كلمة المرور يجب أن تكون 6 أحرف على الأقل"}
+
+	_throttle_registration(phone)
+
+	generatedEmail = f"{phone}@yemen.local"
+
+	# Check if user already exists by email or mobile number
+	if frappe.db.exists("User", generatedEmail) or frappe.db.exists("User", {"mobile_no": phone}):
+		return {"status": "error", "message": "هذا الحساب مسجل مسبقاً، يرجى تسجيل الدخول مباشرة."}
+
+	try:
+		# Create the user document
+		user = frappe.get_doc({
+			"doctype": "User",
+			"email": generatedEmail,
+			"first_name": full_name,
+			"mobile_no": phone,
+			"user_type": "Website User",
+			"enabled": 1,
+			"send_welcome_email": 0
+		})
+		user.insert(ignore_permissions=True)
+
+		# Set the password
+		update_password(generatedEmail, new_password)
+
+		return {"status": "success", "message": "تم إنشاء الحساب بنجاح!"}
+
+	except frappe.exceptions.DuplicateEntryError:
+		# The `exists` check above is advisory: two simultaneous sign-ups for the
+		# same number can both pass it, and the unique index is what actually
+		# decides. Report the loser with the same message the check would have.
+		return {"status": "error", "message": "هذا الحساب مسجل مسبقاً، يرجى تسجيل الدخول مباشرة."}
+	except Exception:
+		# Never echo the exception: a database error message can name tables,
+		# columns or values, and this endpoint is reachable by anyone.
+		frappe.log_error(title="register_user_by_phone failed")
+		return {"status": "error", "message": "تعذر إنشاء الحساب، حاول مرة أخرى"}
 
 def _admin_child_doctype():
 	"""The child table behind Webshop Settings.admin_users.
@@ -106,8 +161,10 @@ def _admin_user_column():
 def _is_admin():
 	"""Is the session user an admin?
 
-	Deliberately NOT cached: an admin removed from the table loses access on
-	their next request rather than at the next app restart.
+	Memoised for the length of a single request, never across requests: an admin
+	removed from the table loses access on their next request rather than at the
+	next app restart, while one request that asks several times (the editor's
+	payload builder re-checks) still costs a single query.
 	"""
 	user = frappe.session.user
 	if not user or user == "Guest":
@@ -117,6 +174,10 @@ def _is_admin():
 	# misconfigured table.
 	if user == "Administrator":
 		return True
+
+	cached = getattr(frappe.local, "_webshop_is_admin", None)
+	if cached is not None:
+		return cached
 
 	child = _admin_child_doctype()
 	if not child:
@@ -131,7 +192,7 @@ def _is_admin():
 	# Filtered in the query rather than pulled into Python: the table holds every
 	# admin, and the client has no business receiving that list.
 	column = _admin_user_column()
-	return bool(
+	result = bool(
 		frappe.get_all(
 			child,
 			filters={"parent": "Webshop Settings", column: user},
@@ -139,6 +200,8 @@ def _is_admin():
 			limit_page_length=1,
 		)
 	)
+	frappe.local._webshop_is_admin = result
+	return result
 
 
 def _require_admin():
@@ -208,9 +271,15 @@ def _decode_image(file_base64):
 	if len(raw) > MAX_RAW_IMAGE_BYTES:
 		frappe.throw(_("That image is too large. Please use a smaller photo."))
 
+	# A few kilobytes of crafted data can still decode to an enormous bitmap.
+	# Cap the decoded pixel count and report a breach as a bad image rather than
+	# letting Pillow raise an unhandled error or the worker run out of memory.
+	Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 	try:
 		image = Image.open(io.BytesIO(raw))
 		image.load()
+	except Image.DecompressionBombError:
+		frappe.throw(_("That image is too large to process."))
 	except Exception:
 		frappe.throw(_("That file is not a readable image."))
 
@@ -232,11 +301,6 @@ def _decode_image(file_base64):
 
 
 def _delete_superseded_image(previous_url, item_code):
-	"""Remove the old product photo, but only if this item is its sole owner.
-
-	Deleting by URL alone would delete an image another item still points at —
-	from a copy, a template, or a shared asset — and break that product silently.
-	"""
 	if not previous_url or "/files/" not in previous_url:
 		return
 
@@ -251,8 +315,6 @@ def _delete_superseded_image(previous_url, item_code):
 		as_dict=True,
 	)
 	if not attached_to:
-		# Either it was never attached to an Item (so it may be shared) or it is
-		# already gone. Either way, leave it alone.
 		return
 
 	still_referenced = frappe.db.exists(
@@ -265,11 +327,33 @@ def _delete_superseded_image(previous_url, item_code):
 	try:
 		frappe.delete_doc("File", attached_to.name, ignore_permissions=True, force=True)
 	except Exception:
-		# A locked or already-removed file is not worth failing an edit over.
 		frappe.log_error(title="Could not remove superseded item image")
 
 
-from frappe.utils.file_manager import save_file
+def _compute_blurhash_for_image(image_url):
+
+	
+
+	if not blurhash or not image_url:
+		return None
+	try:
+		if not image_url.startswith("http"):
+			image_url = frappe.utils.get_url(image_url)
+			
+		import requests
+		resp = requests.get(image_url, timeout=15)
+		resp.raise_for_status()
+		img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+		img.thumbnail((64, 64))
+		
+		image_array = np.array(img)
+		bh = blurhash.encode(image_array, 4, 3)
+		
+		return bh
+	except Exception as e:
+		frappe.log_error(f"Failed to generate blurhash for {image_url}: {e}", "admin_api._compute_blurhash_for_image")
+		return None
+
 
 def _save_item_image(item_code, file_base64, file_name=None):
 	"""Store the photo, attach it to Item.image and point Website Item at it.
@@ -300,8 +384,17 @@ def _save_item_image(item_code, file_base64, file_name=None):
 		df="image"
 	)
 
+	bh = None
+	if blurhash and file_doc.file_url:
+		try:
+			bh = _compute_blurhash_for_image(file_doc.file_url)
+		except Exception:
+			bh = None
+	
 	if website_item:
 		frappe.db.set_value("Website Item", website_item, "website_image", file_doc.file_url)
+		if bh:
+			frappe.db.set_value("Website Item", website_item, "blurhash", bh, update_modified=False)
 		frappe.db.set_value("Item", item_code, "image", file_doc.file_url)
 
 	_delete_superseded_image(previous, item_code)
@@ -334,6 +427,24 @@ def _item_price_row(item_code, uom):
 	)
 
 
+def _item_price_map(item_code):
+	"""Stored selling prices for an item, keyed by UOM, in one query.
+
+	`_uom_rows` needs to know, for every UOM, whether its price is stored or
+	merely derived. Asking per UOM was one query per row; this fetches the
+	handful of rows for the item in a single round trip.
+	"""
+	return {
+		row.uom: row
+		for row in frappe.get_all(
+			"Item Price",
+			filters={"item_code": item_code, "price_list": _price_list(), "selling": 1},
+			fields=["name", "price_list_rate", "currency", "uom"],
+			limit_page_length=0,
+		)
+	}
+
+
 def _uom_rows(item_code):
 	"""Every UOM on the item, with its conversion factor and selling price.
 
@@ -346,13 +457,14 @@ def _uom_rows(item_code):
 	# Read back unrounded: a stored 0.75 must reach the editor as 0.75, and the
 	# field is only ever rounded by ERPNext at save time.
 	factors = {row.uom: flt(row.conversion_factor) for row in (item.uoms or [])}
+	stored = _item_price_map(item_code)
 
 	rows = []
 	for entry in _get_calculated_uoms(item_code):
 		uom = entry.get("uom")
 		if not uom:
 			continue
-		explicit = _item_price_row(item_code, uom)
+		explicit = stored.get(uom)
 		if uom == stock_uom:
 			# The stock UOM is the conversion base, so its factor is always 1 by
 			# definition. Reporting anything else would invite an admin to enter a
@@ -819,12 +931,22 @@ def admin_update_item(
 	image_url = None
 	if image_base64:
 		image_url = _save_item_image(item_code, image_base64, image_name)
+	else:
+		# Try to generate blurhash from existing website image if missing
+		try:
+			wi_name = frappe.db.get_value("Website Item", {"item_code": item_code}, "name")
+			if wi_name:
+				cur = frappe.db.get_value("Website Item", wi_name, ["website_image", "blurhash"], as_dict=True)
+				if cur and cur.website_image and not cur.blurhash:
+					bh = _compute_blurhash_for_image(cur.website_image)
+					if bh:
+						frappe.db.set_value("Website Item", wi_name, "blurhash", bh, update_modified=False)
+		except Exception:
+			pass
 
 	precision_note = _float_precision_warning()
 	if precision_note:
 		warnings.append(precision_note)
-
-	frappe.db.commit()
 
 	return {
 		"ok": True,
@@ -1060,11 +1182,18 @@ def admin_create_item(
 	image_url = None
 	if image_base64:
 		image_url = _save_item_image(code, image_base64, image_name)
+	else:
+		try:
+			cur = frappe.db.get_value("Website Item", website_item.name, ["website_image", "blurhash"], as_dict=True)
+			if cur and cur.website_image and not cur.blurhash:
+				bh = _compute_blurhash_for_image(cur.website_image)
+				if bh:
+					frappe.db.set_value("Website Item", website_item.name, "blurhash", bh, update_modified=False)
+		except Exception:
+			pass
 
 	if recommended_json:
 		_apply_recommended(website_item.name, code, _parse_json_list(recommended_json, "recommended_json"))
-
-	frappe.db.commit()
 
 	return {
 		"ok": True,
@@ -1083,7 +1212,6 @@ def _ensure_route(website_item):
 	that also fails the product is left for the shop owner rather than published
 	under a blank URL.
 	"""
-	frappe.db.commit()
 	route = frappe.db.get_value("Website Item", website_item.name, "route")
 	if route:
 		return
@@ -1095,8 +1223,6 @@ def _ensure_route(website_item):
 		frappe.db.set_value(
 			"Website Item", website_item.name, "route", "products/{0}".format(slugify(website_item.item_name or website_item.item_code))
 		)
-
-	frappe.db.commit()
 
 
 def _creation_warnings(group, published):

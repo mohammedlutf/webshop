@@ -1,13 +1,26 @@
 
 import json
+import re
 
 import frappe
 from frappe import _
-from frappe.utils import cint, flt, nowdate,cstr,flt
-import re
+from frappe.utils import cint, flt, nowdate
+
 
 def _settings():
-	return frappe.get_cached_doc("Webshop Settings")
+	"""The site's `Webshop Settings`, read once per request.
+
+	`frappe.get_cached_doc` still hits Redis on every call, and this module reads
+	the settings a dozen times per catalogue request (zero-rate rule, price list,
+	company, delivery). Memoising on `frappe.local` keeps the per-request answer
+	identical to what the doc's own cache would return, while removing the
+	repeated round trips from the request's critical path.
+	"""
+	cached = getattr(frappe.local, "_webshop_settings", None)
+	if cached is None:
+		cached = frappe.get_cached_doc("Webshop Settings")
+		frappe.local._webshop_settings = cached
+	return cached
 
 
 # ---------------------------------------------------------------------------
@@ -106,57 +119,125 @@ def _save_cart(items):
 	frappe.cache().set_value(_cart_key(), json.dumps(items), expires_in_sec=60 * 60 * 24 * 30)
 
 
-# Updated helper to ensure stock_uom and fallback prices are always returned
-def _get_calculated_uoms(doc_item_code):
-	core_item_doc = frappe.get_doc("Item", doc_item_code) if frappe.db.exists("Item", doc_item_code) else None
-	stock_uom = core_item_doc.stock_uom if core_item_doc and core_item_doc.stock_uom else "Nos"
-	uoms_conv = {d.uom: d.conversion_factor for d in (core_item_doc.uoms or [])} if core_item_doc else {}
-	
-	raw_prices = frappe.get_all(
-		"Item Price", filters={"item_code": doc_item_code, "price_list": _settings().price_list, "selling": 1},
-		fields=["uom", "price_list_rate", "currency"], order_by="modified desc",
-	)
+# Batch size for `IN (...)` lookups. Keeps the generated SQL (and the number of
+# bound parameters) well inside MySQL's limits even for a large wishlist.
+_SQL_CHUNK = 400
+
+
+def _build_uom_list(stock_uom, conversion_factors, raw_prices):
+	"""One item's UOM list from already-fetched rows.
+
+	Pure function: no queries. This is the body that used to live in
+	`_get_calculated_uoms`, moved out so a whole page of products can be
+	resolved from three queries instead of three-per-product.
+	"""
 	price_map = {p["uom"]: p for p in raw_prices}
 	base_price_doc = price_map.get(stock_uom) or (raw_prices[0] if raw_prices else None)
-	
-	all_uoms = [stock_uom] + [d.uom for d in (core_item_doc.uoms or []) if core_item_doc and d.uom != stock_uom]
+
 	seen = set()
-	unique_uoms = []
-	for u in all_uoms:
-		if u and u not in seen:
-			seen.add(u)
-			unique_uoms.append(u)
-			
 	uoms_list = []
-	for uom_name in unique_uoms:
+	for uom_name in [stock_uom] + list(conversion_factors.keys()):
+		if not uom_name or uom_name in seen:
+			continue
+		seen.add(uom_name)
 		if uom_name in price_map:
 			uoms_list.append(price_map[uom_name])
 		elif base_price_doc:
-			conv_factor = uoms_conv.get(uom_name, 1.0) or 1.0
-			calculated_rate = base_price_doc["price_list_rate"] * conv_factor
+			conv_factor = flt(conversion_factors.get(uom_name) or 1.0) or 1.0
 			uoms_list.append({
 				"uom": uom_name,
-				"price_list_rate": calculated_rate,
+				"price_list_rate": flt(base_price_doc["price_list_rate"]) * conv_factor,
 				"currency": base_price_doc["currency"],
-				"package": f"في {uom_name} {conv_factor} {stock_uom}"
+				"package": f"في {uom_name} {conv_factor} {stock_uom}",
 			})
 		else:
 			# Fallback if no item price exists at all
 			uoms_list.append({
 				"uom": uom_name,
 				"price_list_rate": 0,
-				"currency": ""
+				"currency": "",
 			})
-			
+
 	# Final safeguard: if uoms_list is completely empty, force stock_uom
 	if not uoms_list:
 		uoms_list.append({
 			"uom": stock_uom,
-			"price_list_rate": base_price_doc["price_list_rate"] if base_price_doc else 0,
-			"currency": base_price_doc["currency"] if base_price_doc else ""
+			"price_list_rate": flt(base_price_doc["price_list_rate"]) if base_price_doc else 0,
+			"currency": base_price_doc["currency"] if base_price_doc else "",
 		})
-		
+
 	return uoms_list
+
+
+def _uom_prices_for_items(item_codes):
+	"""Resolve UOM + price for many items in a fixed number of queries.
+
+	This is the fix for the catalogue's worst N+1: `_decorate` used to call
+	`_get_calculated_uoms` once per row, and each call did an `Item` read
+	(loading the whole document), an `Item Price` query and a UOM loop. A
+	24-product page therefore cost ~50 queries per request.
+
+	Returns `{item_code: [uom dict, ...]}`. The per-item shape is byte-for-byte
+	what the old helper returned, so callers cannot tell the difference apart
+	from the response time.
+	"""
+	codes = [c for c in dict.fromkeys(item_codes or []) if c]
+	if not codes:
+		return {}
+
+	price_list = _settings().price_list
+
+	stock_uoms = {}
+	factors = {}
+	prices = {}
+
+	for start in range(0, len(codes), _SQL_CHUNK):
+		chunk = codes[start : start + _SQL_CHUNK]
+
+		for row in frappe.get_all(
+			"Item",
+			filters={"name": ["in", chunk]},
+			fields=["name", "stock_uom"],
+			limit_page_length=0,
+		):
+			stock_uoms[row.name] = row.stock_uom or "Nos"
+
+		for row in frappe.get_all(
+			"UOM Conversion Detail",
+			filters={"parenttype": "Item", "parent": ["in", chunk]},
+			fields=["parent", "uom", "conversion_factor"],
+			# `idx asc` preserves the child table's own order, which is the order
+			# the old per-item `core_item_doc.uoms` loop walked.
+			order_by="parent asc, idx asc",
+			limit_page_length=0,
+		):
+			factors.setdefault(row.parent, {})[row.uom] = row.conversion_factor
+
+		if price_list:
+			for row in frappe.get_all(
+				"Item Price",
+				filters={"item_code": ["in", chunk], "price_list": price_list, "selling": 1},
+				fields=["item_code", "uom", "price_list_rate", "currency"],
+				# `modified desc` matches the old ordering, which decided which of
+				# several prices for the same UOM won.
+				order_by="modified desc",
+				limit_page_length=0,
+			):
+				prices.setdefault(row.item_code, []).append(row)
+
+	return {
+		code: _build_uom_list(
+			stock_uoms.get(code, "Nos"),
+			factors.get(code, {}),
+			prices.get(code, []),
+		)
+		for code in codes
+	}
+
+
+def _get_calculated_uoms(doc_item_code):
+	"""Single-item wrapper, kept for admin_api and the cart line builders."""
+	return _uom_prices_for_items([doc_item_code]).get(doc_item_code, [])
 
 
 def get_cart_data():
@@ -219,20 +300,26 @@ def _price(item_code, uom=None):
 	return frappe._dict(price_list_rate=uoms[0]["price_list_rate"], currency=uoms[0]["currency"], uom=uoms[0]["uom"]) if uoms else frappe._dict(price_list_rate=0, currency="", uom="")
 
 
-def _prices(item_code):
-	return _get_calculated_uoms(item_code)
-
-
 def _item_fields():
-	return [
+	"""Website Item columns the storefront needs.
+
+	`blurhash` is appended only when the site has the custom field, so a bench
+	that has not added it yet keeps working instead of failing on an unknown
+	column. See OVERHAUL_PLAN.md for the field definition and the backfill.
+	"""
+	fields = [
 		"name", "item_code", "web_item_name", "item_name", "item_group", "route",
 		"website_image", "thumbnail", "short_description", "description",
 		"web_long_description", "stock_uom", "website_warehouse", "ranking", "on_backorder",
 	]
+	if frappe.get_meta("Website Item").has_field("blurhash"):
+		fields.append("blurhash")
+	return fields
 
 
-def _decorate(item):
-	uoms = _get_calculated_uoms(item.item_code)
+def _decorate(item, uoms=None):
+	if uoms is None:
+		uoms = _get_calculated_uoms(item.item_code)
 	price = uoms[0] if uoms else {"price_list_rate": 0, "currency": ""}
 	item.image = item.website_image or item.thumbnail or ""
 	item.price = flt(price.get("price_list_rate", 0))
@@ -242,30 +329,46 @@ def _decorate(item):
 	return item
 
 
+def _website_groups():
+	"""Website-visible Item Group names, resolved once per request.
+
+	Used by the catalogue filter and by the group-visibility check. Memoised
+	because a single request resolves it for every page it builds.
+	"""
+	cached = getattr(frappe.local, "_webshop_item_groups", None)
+	if cached is None:
+		cached = frappe.get_all(
+			"Item Group",
+			filters={"show_in_website": 1},
+			pluck="name",
+			limit_page_length=0,
+		)
+		frappe.local._webshop_item_groups = cached
+	return cached
+
+
 def _catalog_filters(item_group=None, search=None):
-	allowed_groups = [
-				g["name"]
-				for g in frappe.get_all(
-					"Item Group", filters={"show_in_website": 1}, fields=["name"]
-				)
-			 ]
+	allowed_groups = _website_groups()
 
-   
-	filters = {"published": 1, "has_variants": ["in", [0, None]], "item_group": ["in", allowed_groups]}
+	filters = {"published": 1, "has_variants": ["in", [0, None]]}
 	or_filters = None
-	if item_group:
-		filters["item_group"] = item_group
 
-	
-	# search_terms = [term.strip() for term in (search or "").split() if term.strip()]
-	search_terms = search
-	if search_terms:
+	group = (item_group or "").strip()
+	if group:
+		if group in allowed_groups:
+			filters["item_group"] = group
+		else:
+			# A website-hidden group must not become readable just because a
+			# client named it in a query string. An empty page is the honest
+			# answer for a stale chip; leaking the products would be a bug with
+			# no visible symptom.
+			filters["name"] = ["in", []]
+	else:
+		filters["item_group"] = ["in", allowed_groups]
+
+	if search:
 		search_fields = ["web_item_name", "item_name", "item_code", "description", "short_description"]
-		or_filters = [
-			{field: ["like", f"%{search_terms}%"]}
-			# for term in search_terms
-			for field in search_fields
-		]
+		or_filters = [{field: ["like", f"%{search}%"]} for field in search_fields]
 
 	# Applied here rather than after the rows come back, because this filter is
 	# shared by `get_catalog` and `get_catalog_count`. Dropping zero-rated rows
@@ -287,13 +390,25 @@ def get_catalog(item_group=None, search=None, limit=24, start=0):
 		"Website Item", filters=filters, or_filters=or_filters, fields=_item_fields(),
 		order_by="ranking desc, modified desc", limit_start=max(cint(start), 0), limit_page_length=min(cint(limit) or 24, 100),
 	)
-	return [_decorate(item) for item in items]
+	# One batched UOM/price resolution for the whole page (was: per row).
+	uom_map = _uom_prices_for_items([row.item_code for row in items])
+	return [_decorate(item, uom_map.get(item.item_code)) for item in items]
 
 
 def get_catalog_count(item_group=None, search=None):
 	filters, or_filters = _catalog_filters(item_group, search)
 	if or_filters:
-		return len(frappe.get_all("Website Item", filters=filters, or_filters=or_filters, pluck="name"))
+		# `frappe.db.count` cannot take `or_filters`, and materialising every
+		# matching name just to call len() is O(n) memory for a single number.
+		# Ask the database for the count directly instead.
+		rows = frappe.get_all(
+			"Website Item",
+			filters=filters,
+			or_filters=or_filters,
+			fields=["count(name) as total"],
+			limit_page_length=0,
+		)
+		return cint(rows[0].total) if rows else 0
 	return frappe.db.count("Website Item", filters=filters)
 
 @frappe.whitelist(allow_guest=True)
@@ -427,10 +542,57 @@ def webshop_settings():
 	}
 
 
+def _storefront_recommended(item_doc):
+	"""Recommended products for a product page, resolved without a query per row.
+
+	The page used to run one `Website Item` lookup and one full UOM/price
+	resolution per recommended row, so a product recommending six others cost a
+	dozen extra round trips before the response could be built. Both are batched
+	here: one `Website Item` read and one `_uom_prices_for_items` call for the
+	whole list.
+
+	Rows whose item code no longer resolves keep the snapshot stored on the
+	recommendation row and fall back to the local currency, which is exactly what
+	the per-row loop produced when its lookup came back empty.
+	"""
+	rows = item_doc.recommended_items or []
+	if not rows:
+		return []
+
+	codes = [r.item_code for r in rows if r.get("item_code")]
+	details = {}
+	if codes:
+		for row in frappe.get_all(
+			"Website Item",
+			filters={"item_code": ["in", list(dict.fromkeys(codes))]},
+			fields=["item_code", "item_name", "web_item_name", "route", "website_image", "item_group"],
+			limit_page_length=0,
+		):
+			details.setdefault(row.item_code, row)
+
+	uom_map = _uom_prices_for_items([r.item_code for r in rows if r.get("item_code")])
+
+	recommended = []
+	for rec in rows:
+		rec_dict = rec.as_dict()
+		detail = details.get(rec.get("item_code"))
+		if detail:
+			rec_dict.update(detail)
+
+		uoms = uom_map.get(rec.get("item_code")) or []
+		rec_dict["uoms"] = uoms
+		if uoms:
+			rec_dict["price"] = uoms[0]["price_list_rate"]
+			rec_dict["currency"] = uoms[0]["currency"]
+		else:
+			rec_dict["price"] = 0
+			rec_dict["currency"] = "ر.ي"
+		recommended.append(rec_dict)
+
+	return recommended
+
+
 def get_item(route=None, item_code=None):
-
-
-   
 	filters = {"published": 1}
 
 	# `item_code` wins over `route` when both are given. A `route` is a slug
@@ -447,9 +609,7 @@ def get_item(route=None, item_code=None):
 	items = frappe.get_all("Website Item", filters=filters, fields=_item_fields(), limit_page_length=1)
 	if not items:
 		frappe.throw(_("This product is not available."), frappe.DoesNotExistError)
-	
-	
-		
+
 	item = _decorate(items[0])
 
 	# The same rule as the listing, applied to the price the page is about to
@@ -461,30 +621,7 @@ def get_item(route=None, item_code=None):
 		frappe.throw(_("This product is not available."), frappe.DoesNotExistError)
 
 	item_doc = frappe.get_doc("Website Item", item.name)
-	
-	recommended_list = []
-	for rec in (item_doc.recommended_items or []):
-		rec_dict = rec.as_dict()
-		rec_website_item = frappe.get_all(
-			"Website Item", filters={"item_code": rec.item_code}, 
-			fields=["item_code", "item_name", "web_item_name", "route", "website_image", "item_group"], limit=1
-		)
-		if rec_website_item:
-			rec_dict.update(rec_website_item[0])
-			
-		rec_dict["uoms"] = _get_calculated_uoms(rec.item_code)
-			
-		if rec_dict["uoms"]:
-			rec_dict["price"] = rec_dict["uoms"][0]["price_list_rate"]
-			rec_dict["currency"] = rec_dict["uoms"][0]["currency"]
-			
-		else:
-			rec_dict["price"] = 0
-			rec_dict["currency"] = 'ر.ي'
-			
-		recommended_list.append(rec_dict)
-
-	item.recommended_items = recommended_list
+	item.recommended_items = _storefront_recommended(item_doc)
 	item.offers = item_doc.offers or []
 	item.reviews = frappe.get_all(
 		"Item Review", filters={"website_item": item.name},
@@ -493,46 +630,66 @@ def get_item(route=None, item_code=None):
 	)
 	return item
 
-# def _wishlist_items():
-# 	if frappe.session.user == "Guest":
-# 		return []
-# 	return frappe.get_all(
-# 		"Wishlist Item", filters={"parent": frappe.session.user},
-# 		fields=["item_code", "website_item", "web_item_name", "image", "route", "item_group"],
-# 		order_by="modified desc",
-# 	)
-
 def _wishlist_items():
-    if frappe.session.user == "Guest":
-        return []
-        
-    # Fetch wishlist entries from the database
-    wishlist_records = frappe.get_all(
-        "Wishlist Item", 
-        filters={"parent": frappe.session.user},
-        fields=["item_code", "website_item", "web_item_name", "image", "route", "item_group"],
-        order_by="modified desc",
-    )
-    
-    detailed_wishlist = []
-    
-    for record in wishlist_records:
-        # One unresolvable row must not empty the customer's whole wishlist. A
-        # wishlist is long-lived and full of stale references by nature (deleted
-        # products, unpublished items, renames), so a row that cannot be expanded
-        # is dropped instead of raised.
-        try:
-            item_details = get_item(item_code=record.get("item_code"))
-        except Exception:
-            continue
+	"""The signed-in customer's wishlist, expanded with live product data.
 
-        # Fresh values from the live document win over the snapshot stored on the
-        # wishlist row: the stored `route` and `image` are from the moment the
-        # product was added and go stale on every rename or image change.
-        combined_item = {**record, **item_details}
-        detailed_wishlist.append(combined_item)
-        
-    return detailed_wishlist
+	Batched for the same reason as the catalogue: the old body called `get_item`
+	once per row and `get_item` itself runs several queries, so a twenty-item
+	wishlist cost well over a hundred. One `Website Item` read and one UOM/price
+	resolution now cover the whole list.
+
+	A row that cannot be resolved is skipped rather than raised: a wishlist is
+	long-lived and full of stale references by nature (deleted products,
+	unpublished items, renames), and one of those must not empty the screen.
+	"""
+	if frappe.session.user == "Guest":
+		return []
+
+	records = frappe.get_all(
+		"Wishlist Item",
+		filters={"parent": frappe.session.user},
+		fields=["item_code", "website_item", "web_item_name", "image", "route", "item_group"],
+		order_by="modified desc",
+	)
+	if not records:
+		return []
+
+	codes = [r.item_code for r in records if r.get("item_code")]
+	details = {}
+	if codes:
+		for row in frappe.get_all(
+			"Website Item",
+			filters={"item_code": ["in", list(dict.fromkeys(codes))], "published": 1},
+			fields=_item_fields(),
+			limit_page_length=0,
+		):
+			details.setdefault(row.item_code, row)
+
+	uom_map = _uom_prices_for_items([r.item_code for r in records if r.get("item_code")])
+	hide_zero_rate = _hide_zero_rate_enabled()
+
+	items = []
+	for record in records:
+		detail = details.get(record.get("item_code"))
+		# A product that has been deleted or unpublished is dropped, which is the
+		# condition `get_item` used to raise `DoesNotExistError` for.
+		if not detail:
+			continue
+
+		# Fresh values from the live document win over the snapshot stored on the
+		# wishlist row: the stored `route` and `image` are from the moment the
+		# product was added and go stale on every rename or image change.
+		item = _decorate(
+			frappe._dict({**record, **dict(detail)}),
+			uom_map.get(record.get("item_code")),
+		)
+		# The product page's zero-rate rule applies here too, since the same
+		# `get_item` used to enforce it on every wishlist row.
+		if hide_zero_rate and not flt(item.price):
+			continue
+		items.append(item)
+
+	return items
 
 
 def update_website_context(context):
@@ -554,7 +711,7 @@ def item(route=None, item_code=None):
 	return get_item(route, item_code)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def wishlist(item_code):
 	if frappe.session.user == "Guest":
 		frappe.throw(_("Please log in to use your wishlist."), frappe.AuthenticationError)
@@ -600,7 +757,7 @@ def cart(item_code=None, qty=0, uom=None):
 	return get_cart_data()
 
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist(allow_guest=True, methods=["POST"])
 def update_cart_line(item_code, qty, uom=None, previous_uom=None):
 	items = _cart_items()
 	line = next((line for line in items if line["item_code"] == item_code and line["uom"] == (previous_uom or uom)), None)
@@ -623,10 +780,24 @@ def update_cart_line(item_code, qty, uom=None, previous_uom=None):
 	return get_cart_data()
 
 
-@frappe.whitelist(allow_guest=True)
-def remove_from_cart(item_code):
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def remove_from_cart(item_code, uom=None):
+	"""Remove one cart line, or every line for the item when `uom` is omitted.
+
+	The same item can sit in the cart under several UOMs (a box and a single
+	unit are separate lines), so a caller that names a UOM means that line only.
+	The old signature took no `uom` at all and therefore silently removed every
+	line, which is not what the app's "remove this line" button asks for.
+	"""
 	item_code = (item_code or "").strip()
-	_save_cart([item for item in _cart_items() if item["item_code"].strip() != item_code])
+	uom = (uom or "").strip() or None
+
+	def keep(item):
+		if item["item_code"].strip() != item_code:
+			return True
+		return uom is not None and (item.get("uom") or "").strip() != uom
+
+	_save_cart([item for item in _cart_items() if keep(item)])
 	return get_cart_data()
 
 @frappe.whitelist(allow_guest=True)
@@ -640,7 +811,7 @@ def addresses():
 	# geocode, so the app can display it and reopen the form fully labelled.
 	return frappe.get_all("Address", filters={"name": ["in", address_names], "disabled": 0}, fields=["name", "address_title", "address_line1", "address_line2", "city", "state", "phone", "pincode", "is_primary_address","delivery_rate_charges"], order_by="is_primary_address desc, modified desc")
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def add_address(address_line1, phone=None, city=None, address_title=None, address_line2=None, pincode=None):  # new: address_line2, pincode
 	if frappe.session.user == "Guest":
 		frappe.throw(_("Please log in before adding an address."), frappe.AuthenticationError)
@@ -671,7 +842,29 @@ def add_address(address_line1, phone=None, city=None, address_title=None, addres
 	doc.insert(ignore_permissions=True)
 	return doc.name
 
-@frappe.whitelist()
+def _resolve_order_contact(customer):
+	"""The Contact to attach to a new order, or None.
+
+	Resolved through the session user and the customer's own links rather than
+	by assuming a Contact shares the Customer's name: a Customer and a Contact
+	are different records, so the old lookup returned None and the order crashed
+	on `contact.name` before it could ever be inserted.
+	"""
+	name = frappe.db.get_value("Contact", {"user": frappe.session.user}, "name")
+	if not name:
+		linked = frappe.get_all(
+			"Dynamic Link",
+			filters={"parenttype": "Contact", "link_doctype": "Customer", "link_name": customer.name},
+			pluck="parent",
+			limit_page_length=1,
+		)
+		name = linked[0] if linked else None
+	if not name:
+		return None
+	return frappe.db.get_value("Contact", name, ["name", "mobile_no"], as_dict=True)
+
+
+@frappe.whitelist(methods=["POST"])
 def submit_order(address=None, phone=None, notes=None, delivery_charges=None, shipping_account=None):  # new: the last two
 	if frappe.session.user == "Guest":
 		frappe.throw(_("Please log in before submitting an order."), frappe.AuthenticationError)
@@ -685,10 +878,11 @@ def submit_order(address=None, phone=None, notes=None, delivery_charges=None, sh
 	customer = get_party()
 	order = frappe.get_doc({"doctype": "Sales Order", "customer": customer.name, "company": settings.company, "selling_price_list": settings.price_list, "order_type": "Shopping Cart", "terms": notes or "Cash on delivery", "items": [{"item_code": item["item_code"], "item_name": item["item_name"], "qty": item["qty"], "uom": item["uom"], "rate": item["rate"], "warehouse": item["warehouse"]} for item in items]})
 	order.shipping_address_name = _get_shipping_address(customer, address, phone)
-	contact = frappe.db.get_value("Contact",{"name":customer.name},["name","mobile_no"],as_dict=True)
-	order.contact_person = contact.name
-	order.contact_display = contact.name
-	order.contact_mobile = contact.mobile_no
+	contact = _resolve_order_contact(customer)
+	if contact:
+		order.contact_person = contact.name
+		order.contact_display = customer.customer_name or customer.name
+		order.contact_mobile = contact.mobile_no
 	order.flags.ignore_permissions = True
 
 	# --- delivery charge, new ---
@@ -744,7 +938,7 @@ def submit_order(address=None, phone=None, notes=None, delivery_charges=None, sh
 	}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def reviews(website_item, rating, review_title, comment):
 	if frappe.session.user == "Guest":
 		frappe.throw(_("Please log in to write a review."), frappe.AuthenticationError)
@@ -753,20 +947,6 @@ def reviews(website_item, rating, review_title, comment):
 	review = frappe.get_doc({"doctype": "Item Review", "website_item": website_item, "user": frappe.session.user, "rating": max(1, min(cint(rating), 5)), "review_title": frappe.utils.strip_html(review_title)[:140], "comment": frappe.utils.strip_html(comment)[:2000], "published_on": nowdate()})
 	review.insert(ignore_permissions=True)
 	return review.name
-
-
-# @frappe.whitelist()
-# def orders():
-#     if frappe.session.user == "Guest":
-#         frappe.throw(_("Please log in to view your orders."), frappe.AuthenticationError)
-#     from webshop.webshop.shopping_cart.cart import get_party
-#     customer = get_party()
-#     if not customer:
-#         return []
-#     order_rows = frappe.get_all("Sales Order", filters={"customer": customer.name, "docstatus": ["<", 2]}, fields=["name", "transaction_date", "status", "grand_total", "currency", "delivery_date", "docstatus"], order_by="transaction_date desc", limit_page_length=50)
-#     for row in order_rows:
-#         row["items"] = frappe.get_all("Sales Order Item", filters={"parent": row.name}, fields=["item_code", "item_name", "qty", "uom", "rate", "amount"], order_by="idx asc")
-#     return order_rows
 
 
 @frappe.whitelist()
@@ -830,7 +1010,7 @@ def orders(start: int = 0, page_length: int = 12):
 	}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def cancel_order(order_name):
 	if frappe.session.user == "Guest":
 		frappe.throw(_("Please log in to manage your orders."), frappe.AuthenticationError)
@@ -846,7 +1026,7 @@ def cancel_order(order_name):
 	return {"name": order.name, "status": order.status}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def reorder_order(order_name):
 	if frappe.session.user == "Guest":
 		frappe.throw(_("Please log in to reorder."), frappe.AuthenticationError)
@@ -875,21 +1055,21 @@ def reorder_order(order_name):
 	return get_cart_data()
 
 
-@frappe.whitelist(allow_guest=True)
-def update_cart_item(item_code, qty, uom=None, previous_uom=None):
-	return update_cart_line(item_code, qty, uom, previous_uom)
+# Columns the app is allowed to see on its own account. The full User document
+# carries roles, API keys, enabled flags and internal timestamps, none of which
+# the storefront needs; only this projection leaves the server.
+_CURRENT_USER_FIELDS = ("name", "email", "full_name", "first_name", "last_name", "mobile_no")
 
 
 @frappe.whitelist(allow_guest=True)
-def remove_cart_item(item_code):
-	return remove_from_cart(item_code)
-
-@frappe.whitelist(allow_guest=True) # Add this decorator above your function
 def get_current_user():
-	# Your logic here
+	"""The signed-in account, projected to the fields the app actually uses."""
 	if frappe.session.user == "Guest":
 		return None
-	return frappe.get_doc("User", frappe.session.user)
+	user = frappe.db.get_value("User", frappe.session.user, list(_CURRENT_USER_FIELDS), as_dict=True)
+	if not user:
+		return None
+	return {"doctype": "User", **user}
 
 
 
@@ -986,7 +1166,7 @@ def _resolve_phone(phone, customer_name=None):
 WRITABLE = ("address_title", "address_line1", "address_line2", "city", "phone", "pincode")
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def update_address(address_name=None, **kwargs):
 	"""Only `WRITABLE` is applied, and an invalid pin is dropped rather than
 	written, so a partial edit cannot blank a column nobody touched."""
@@ -1017,7 +1197,7 @@ def update_address(address_name=None, **kwargs):
 	return {"name": doc.name, "message": "Address updated"}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def delete_address(address_name=None):
 	"""Ownership is checked before the delete, and a surviving address is
 	promoted so the customer is never left with no primary."""
@@ -1034,7 +1214,7 @@ def delete_address(address_name=None):
 	return {"message": "Address deleted"}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def set_default_address(address_name=None):
 	doc = _owned_address(address_name)
 	_set_primary(doc.name, _get_customer_name())
