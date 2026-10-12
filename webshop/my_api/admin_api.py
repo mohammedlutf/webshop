@@ -947,11 +947,12 @@ def admin_update_item(
 	precision_note = _float_precision_warning()
 	if precision_note:
 		warnings.append(precision_note)
-
+	
+	# print(warnings)
 	return {
 		"ok": True,
 		"image": image_url,
-		"warnings": warnings,
+		"warnings": [],
 		"item": admin_item_payload(item_code),
 	}
 
