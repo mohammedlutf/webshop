@@ -21,9 +21,14 @@ import frappe
 from frappe import _
 from frappe.utils import cint, flt, strip_html
 from frappe.utils.file_manager import save_file
+from frappe.utils.nestedset import get_root_of
 from frappe.utils.password import update_password
 
-from webshop.my_api.api import _get_calculated_uoms, _settings
+from webshop.my_api.api import (
+	_ensure_leaf_customer_group,
+	_get_calculated_uoms,
+	_settings,
+)
 
 try:
 	import blurhash
@@ -73,6 +78,103 @@ def _throttle_registration(phone, limit=10, window=60 * 60):
 	frappe.cache().set_value(key, attempts + 1, expires_in_sec=window)
 
 
+def _ensure_contact_for_user(user):
+	"""Return the Contact for a user, creating it synchronously if it is missing.
+
+	`User.on_update` enqueues `create_contact` to run *after commit*, so at
+	sign-up time the Contact may not exist yet and there would be nothing to link
+	to a new Customer. Creating it here makes that write synchronous; the
+	background job then only finds it and refreshes it.
+	"""
+	from frappe.contacts.doctype.contact.contact import get_contact_name
+	from frappe.core.doctype.user.user import create_contact
+
+	def _find():
+		return get_contact_name(user.email) or frappe.db.get_value(
+			"Contact", {"user": user.name}, "name"
+		)
+
+	contact = _find()
+	if not contact:
+		create_contact(user, ignore_mandatory=True)
+		contact = _find()
+	return contact
+
+
+def _default_customer_group():
+	"""A leaf Customer Group for new sign-ups, whatever the settings hold.
+
+	`Webshop Settings.default_customer_group` may point at a group node, which
+	ERPNext refuses on a Customer. The storefront's own `_ensure_leaf_customer_group`
+	already resolves that; this adds a last-resort leaf so a misconfigured setting
+	does not turn every sign-up into a failure.
+	"""
+	try:
+		group = _ensure_leaf_customer_group()
+	except Exception:
+		frappe.log_error(title="register_user_by_phone: customer group lookup failed")
+		group = None
+
+	if group and not frappe.db.get_value("Customer Group", group, "is_group"):
+		return group
+
+	leaf = frappe.get_all(
+		"Customer Group", filters={"is_group": 0}, pluck="name", limit_page_length=1
+	)
+	return leaf[0] if leaf else None
+
+
+def _create_customer_for_user(user, full_name, phone):
+	"""Create the Customer behind a new website user and link their Contact.
+
+	This is the same thing `webshop...shopping_cart.cart.get_party` does lazily on
+	the first add-to-cart, done at sign-up instead so the Contact that already
+	represents the user is the one linked to the Customer, rather than a second
+	orphaned Contact created later.
+	"""
+	contact = _ensure_contact_for_user(user)
+
+	group = _default_customer_group()
+	if not group:
+		frappe.throw(_("No Customer Group is available to create the customer."))
+
+	settings = _settings()
+	customer = frappe.get_doc(
+		{
+			"doctype": "Customer",
+			"customer_name": full_name,
+			"customer_type": "Individual",
+			"customer_group": group,
+			"territory": get_root_of("Territory"),
+			"email_id": user.email,
+			"mobile_no": phone,
+			# Pre-set so the Customer does not spawn a *second* Contact of its
+			# own, and so this Contact is the customer's primary one.
+			"customer_primary_contact": contact,
+			# Adding the user as a portal user is what makes ERPNext append the
+			# Customer link to that Contact and grant the user the Customer role.
+			"portal_users": [{"user": user.name}],
+		}
+	)
+
+	# Same receivable-account assignment a customer gets when the storefront
+	# creates one lazily, so an existing customer is not missing it.
+	if settings.get("enable_checkout"):
+		try:
+			from webshop.webshop.shopping_cart.cart import get_debtors_account
+
+			account = get_debtors_account(settings)
+			if account:
+				customer.append("accounts", {"company": settings.company, "account": account})
+		except Exception:
+			# The account is an enhancement, not a reason to lose the customer.
+			frappe.log_error(title="register_user_by_phone: debtors account lookup failed")
+
+	customer.flags.ignore_mandatory = True
+	customer.insert(ignore_permissions=True)
+	return customer.name
+
+
 @frappe.whitelist(allow_guest=True, methods=["POST"])
 def register_user_by_phone(phone, full_name, new_password):
 	"""Create a website user from a phone number.
@@ -115,6 +217,14 @@ def register_user_by_phone(phone, full_name, new_password):
 
 		# Set the password
 		update_password(generatedEmail, new_password)
+
+		# Create the Customer and link the user's Contact to it. Kept best-effort
+		# so a customer-setup problem (e.g. an unconfigured Customer Group) does
+		# not stop the account from being created; `get_party` will retry lazily.
+		try:
+			_create_customer_for_user(user, full_name, phone)
+		except Exception:
+			frappe.log_error(title="register_user_by_phone: customer creation failed")
 
 		return {"status": "success", "message": "تم إنشاء الحساب بنجاح!"}
 
