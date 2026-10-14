@@ -22,8 +22,7 @@ class AppPushNotification(Document):
 		a 200) could report "sent to 100 devices" for a batch where every token
 		was invalid.
 		"""
-		if self.status == "Sent":
-			frappe.throw("This campaign has already been sent.")
+		# Allow resending the same campaign multiple times
 
 		# Audience -> device filter. "All Devices" sends to both guest tokens and
 		# account-bound tokens (whose `is_guest` is 0).
