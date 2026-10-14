@@ -866,8 +866,6 @@ def _resolve_order_contact(customer):
 
 @frappe.whitelist(methods=["POST"])
 def submit_order(address=None, phone=None, notes=None, delivery_charges=None, shipping_account=None):  # new: the last two
-	print("///////////////////////////")
-	print(delivery_charges)
 	if frappe.session.user == "Guest":
 		frappe.throw(_("Please log in before submitting an order."), frappe.AuthenticationError)
 	settings = _settings()
