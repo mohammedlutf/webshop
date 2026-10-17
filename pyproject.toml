@@ -9,7 +9,8 @@ readme = "README.md"
 dynamic = ["version"]
 dependencies = [
     "blurhash",
-    "numpy"
+    "numpy",
+    "firebase-admin"
 ]
 
 [build-system]

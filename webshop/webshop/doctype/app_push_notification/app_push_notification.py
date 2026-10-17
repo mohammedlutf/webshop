@@ -1,9 +1,45 @@
+import os
+import re
+
 import frappe
 from frappe.model.document import Document
-import requests
 
-_EXPO_PUSH_ENDPOINT = "https://exp.host/--/api/v2/push/send"
-_EXPO_BATCH_SIZE = 100
+try:
+	import firebase_admin
+	from firebase_admin import credentials, messaging
+except ImportError:  # firebase-admin is a bench-level dependency, not an app one
+	firebase_admin = None
+	credentials = None
+	messaging = None
+
+# The Firebase service-account key lives next to the App Device Token doctype
+# (i.e. the same folder the app is deployed into). It authorises this server to
+# talk to FCM directly, so no FCM credentials ever need to be handed to Expo/EAS.
+_SERVICE_ACCOUNT_FILENAME = os.path.join(
+    frappe.get_site_path("private"),
+    "ecommerce-efd8b-firebase-adminsdk-fbsvc-94ee7d13d2.json"
+)
+# _SERVICE_ACCOUNT_FILENAME = "ecommerce-efd8b-firebase-adminsdk-fbsvc-94ee7d13d2.json"
+_SERVICE_ACCOUNT_HINT = "firebase-adminsdk"
+
+
+# A *named* Firebase app keeps us from clobbering anything else on the bench
+# that already initialised the SDK under the default name.
+_FIREBASE_APP_NAME = "zad-market-fcm"
+_firebase_app = None
+
+# FCM accepts at most 500 tokens per multicast request.
+_BATCH_SIZE = 500
+
+# Must match the channel the app creates at runtime (DEFAULT_CHANNEL_ID in
+# src/context/NotificationContext.js) and the plugin's `defaultChannel`.
+_ANDROID_CHANNEL_ID = "default_v2"
+
+# Tokens that are *not* FCM registration tokens. Expo's push service and a bare
+# APNs device token both look different from an FCM token, and neither can be
+# addressed through the FCM HTTP v1 API.
+_EXPO_PREFIXES = ("ExponentPushToken[", "ExpoPushToken[")
+_APNS_TOKEN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 class AppPushNotification(Document):
@@ -13,18 +49,24 @@ class AppPushNotification(Document):
 
 	@frappe.whitelist()
 	def send_push_notification(self):
-		"""Dispatch the campaign to every registered device in the audience.
+		"""Dispatch the campaign to every registered device through FCM (HTTP v1).
 
-		The Expo HTTP API answers with one *ticket* per message, not a single
-		boolean. `status == ok` on the HTTP response only means "Expo accepted
-		the batch"; the per-ticket `status` field is the real delivery verdict.
-		That is why the old code (which counted the whole batch as delivered on
-		a 200) could report "sent to 100 devices" for a batch where every token
-		was invalid.
+		Delivery goes straight from this ERPNext site to Google using the
+		service-account key stored beside the App Device Token doctype. Nothing
+		is routed through Expo's push service, so the app only has to hand us a
+		native FCM registration token (see `register_token`).
+
+		`messaging.send_each_for_multicast` returns one result *per token*, not a
+		single boolean, which is what lets us tell a real delivery from a stale
+		token and prune the latter.
 		"""
-		# Allow resending the same campaign multiple times
+		if not _fcm_available():
+			frappe.throw(
+				"firebase-admin is not installed on this bench. Run "
+				"`pip install firebase-admin`, then restart the workers."
+			)
 
-		# Audience -> device filter. "All Devices" sends to both guest tokens and
+		# Audience -> device filter. "All Devices" targets both guest tokens and
 		# account-bound tokens (whose `is_guest` is 0).
 		filters = {}
 		if self.target_audience == "Guests Only":
@@ -35,127 +77,260 @@ class AppPushNotification(Document):
 		rows = frappe.get_all(
 			"App Device Token",
 			filters=filters,
-			fields=["name", "device_token"],
+			fields=["name", "device_token", "platform"],
 			order_by="last_active desc",
 			limit_page_length=0,
 		)
 		if not rows:
 			frappe.throw("No device tokens found matching the selected target audience.")
 
-		headers = {
-			"Accept": "application/json",
-			"Accept-Encoding": "gzip, deflate",
-			"Content-Type": "application/json",
-		}
+		# This sender can only address FCM registration tokens. Any legacy
+		# Expo/APNs rows are skipped (and reported) instead of failing the whole
+		# campaign on the first unusable token.
+		sendable = []
+		skipped = []
+		for row in rows:
+			token = (row.device_token or "").strip()
+			if not token:
+				continue
+			if _token_kind(token) == "fcm":
+				sendable.append(row)
+			else:
+				skipped.append(row)
 
-		# `data` is delivered to the app verbatim on every platform and is how
-		# the inbox screen identifies the campaign. `campaign_id` is the
-		# document name; `doctype` lets the app route generic notifications.
-		payload = {
-			"campaign_id": self.name,
+		data = {
+			"campaign_id": str(self.name),
 			"doctype": "App Push Notification",
-			"target_audience": self.target_audience,
+			"target_audience": str(self.target_audience or ""),
+			"title": str(self.title or ""),
+			"body": str(self.message or ""),
 		}
 
-		successful = 0
+		delivered = 0
 		failed = 0
-		dead_tokens = []
+		removed = 0
 
-		for start in range(0, len(rows), _EXPO_BATCH_SIZE):
-			batch = rows[start : start + _EXPO_BATCH_SIZE]
-			messages = [
-				{
-					"to": row.device_token,
-					"sound": "default",
-					"title": self.title,
-					"body": self.message,
-					"data": payload,
-					"priority": "high",
-				}
-				for row in batch
-			]
-
-			try:
-				response = requests.post(
-					_EXPO_PUSH_ENDPOINT,
-					json=messages,
-					headers=headers,
-					timeout=30,
-				)
-			except Exception as e:
-				_error("Push Campaign HTTP error: {}".format(e), self.name)
-				# One network blip must not abort the whole campaign: mark the
-				# batch unsent and move on to the next one.
-				failed += len(batch)
-				continue
-
-			if response.status_code != 200:
-				failed += len(batch)
-				_error(
-					"Push Campaign HTTP {} for campaign {}: {}".format(
-						response.status_code, self.name, _safe_body(response)
-					),
-					self.name,
-				)
-				continue
-
-			try:
-				tickets = response.json().get("data", [])
-			except ValueError:
-				failed += len(batch)
-				_error("Push Campaign invalid JSON response", self.name)
-				continue
-
-			for row, ticket in zip(batch, tickets):
-				if not isinstance(ticket, dict):
-					failed += 1
+		if sendable:
+			app = _get_firebase_app()
+			name_by_token = {r.device_token.strip(): r.name for r in sendable}
+			results = _deliver(
+				app,
+				[r.device_token.strip() for r in sendable],
+				self.title,
+				self.message,
+				data,
+			)
+			dead = []
+			for res in results:
+				if res["ok"]:
+					delivered += 1
 					continue
-				if ticket.get("status") == "ok":
-					successful += 1
-					continue
-
-				details = ticket.get("details") or {}
-				reason = details.get("error") or ticket.get("message") or "Unknown error"
-
-				# The fastest way to detect a stale token: Expo tells us the
-				# device is no longer reachable. Delete the row so future
-				# campaigns stop wasting a slot in the batch.
-				if reason == "DeviceNotRegistered":
-					dead_tokens.append(row.name)
 				failed += 1
+				name = name_by_token.get(res["token"])
+				if _is_dead_token(res["exception"]) and name:
+					dead.append(name)
 				_error(
-					"Push ticket error for token {} ({}): {}".format(
-						row.name, row.device_token, reason
+					"FCM send failed for {} ({}): {}".format(
+						name or res["token"], res["token"], res["error"]
 					),
 					self.name,
 				)
 
-		if dead_tokens:
-			for name in dead_tokens:
+			# Unregistered / wrong-project tokens can never succeed again: drop
+			# them so future campaigns stop spending a slot on them.
+			for name in dead:
 				try:
-					frappe.delete_doc("App Device Token", name, force=True, ignore_permissions=True)
-				except Exception as e:
-					_error("Could not remove dead token {}: {}".format(name, e), self.name)
+					frappe.delete_doc(
+						"App Device Token", name, force=True, ignore_permissions=True
+					)
+					removed += 1
+				except Exception as exc:
+					_error("Could not remove dead token {}: {}".format(name, exc), self.name)
+		else:
+			_error(
+				"No FCM tokens for campaign {} ({} non-FCM token(s) skipped).".format(
+					self.name, len(skipped)
+				),
+				self.name,
+			)
 
-		self.status = "Sent" if successful > 0 else "Failed"
-		self.sent_count = successful
+		if skipped:
+			_error(
+				"Skipped {} non-FCM device token(s) on campaign {}: iOS/APNs and legacy "
+				"Expo tokens cannot be sent through FCM.".format(len(skipped), self.name),
+				self.name,
+			)
+
+		self.status = "Sent" if delivered > 0 else "Failed"
+		self.sent_count = delivered
 		self.flags.ignore_permissions = True
 		self.save(ignore_permissions=True)
 		frappe.db.commit()
 
 		return {
 			"status": "completed",
-			"delivered_count": successful,
+			"delivered_count": delivered,
 			"failed_count": failed,
-			"removed_tokens": len(dead_tokens),
+			"removed_tokens": removed,
+			"skipped_count": len(skipped),
 		}
 
 
-def _safe_body(response):
+# --- Firebase plumbing --------------------------------------------------------
+
+
+def _fcm_available():
+	return firebase_admin is not None and credentials is not None and messaging is not None
+
+
+def _service_account_path():
+	"""Resolve the Firebase service-account JSON on disk.
+
+	Precedence: an explicit `fcm_service_account_path` in site_config.json, then
+	the exact key shipped next to the App Device Token doctype, then any
+	`*firebase-adminsdk*.json` dropped in that folder.
+	"""
+	configured = frappe.conf.get("fcm_service_account_path") or frappe.conf.get(
+		"firebase_service_account"
+	)
+	if configured and os.path.exists(configured):
+		return configured
+
+	# .../<app>/<module>/doctype/app_push_notification/app_push_notification.py
+	doctype_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+	candidates = [
+		os.path.join(doctype_dir, "app_device_token", _SERVICE_ACCOUNT_FILENAME),
+		os.path.join(doctype_dir, _SERVICE_ACCOUNT_FILENAME),
+	]
+	for candidate in candidates:
+		if os.path.exists(candidate):
+			return candidate
+
+	for folder in (os.path.join(doctype_dir, "app_device_token"), doctype_dir):
+		if os.path.isdir(folder):
+			for entry in os.listdir(folder):
+				if entry.endswith(".json") and _SERVICE_ACCOUNT_HINT in entry:
+					return os.path.join(folder, entry)
+
+	frappe.throw(
+		"Firebase service-account key not found. Expected "
+		"'{0}' beside the App Device Token doctype, or set "
+		"`fcm_service_account_path` in site_config.json.".format(_SERVICE_ACCOUNT_FILENAME)
+	)
+
+
+def _get_firebase_app():
+	"""Return a cached, named firebase_admin app (initialised on first use)."""
+	global _firebase_app
+	if _firebase_app is not None:
+		return _firebase_app
 	try:
-		return (response.text or "")[:500]
-	except Exception:
-		return ""
+		_firebase_app = firebase_admin.get_app(_FIREBASE_APP_NAME)
+	except ValueError:
+		# Not initialised yet under this name.
+		cred = credentials.Certificate(_service_account_path())
+		_firebase_app = firebase_admin.initialize_app(cred, name=_FIREBASE_APP_NAME)
+	return _firebase_app
+
+
+def _deliver(app, tokens, title, body, data):
+	"""Send one campaign to `tokens`; return per-token result dicts.
+
+	Each result is {"token", "ok", "error", "exception"} so the caller can decide
+	which failures mean "this token is dead".
+	"""
+	results = []
+	android = messaging.AndroidConfig(
+		priority="high",
+		notification=messaging.AndroidNotification(
+			channel_id=_ANDROID_CHANNEL_ID, sound="default"
+		),
+	)
+	apns = messaging.APNSConfig(
+		headers={"apns-priority": "10"},
+		payload=messaging.APNSPayload(aps=messaging.Aps(sound="default")),
+	)
+
+	use_multicast = hasattr(messaging, "send_each_for_multicast")
+
+	for chunk in _chunks(tokens, _BATCH_SIZE):
+		if use_multicast:
+			message = messaging.MulticastMessage(
+				tokens=chunk,
+				notification=messaging.Notification(title=title, body=body),
+				data=data,
+				android=android,
+				apns=apns,
+			)
+			try:
+				batch = messaging.send_each_for_multicast(message, app=app)
+			except Exception as exc:
+				# Whole request failed (auth/network/quota): attribute it to the
+				# batch rather than pretending individual tokens are dead.
+				for token in chunk:
+					results.append(_result(token, False, exc))
+				continue
+			for token, single in zip(chunk, batch.responses):
+				if single.success:
+					results.append(_result(token, True, None))
+				else:
+					results.append(_result(token, False, single.exception))
+		else:
+			# Older firebase-admin without multicast: one request per token.
+			for token in chunk:
+				message = messaging.Message(
+					token=token,
+					notification=messaging.Notification(title=title, body=body),
+					data=data,
+					android=android,
+					apns=apns,
+				)
+				try:
+					messaging.send(message, app=app)
+					results.append(_result(token, True, None))
+				except Exception as exc:
+					results.append(_result(token, False, exc))
+	return results
+
+
+def _result(token, ok, exception):
+	return {
+		"token": token,
+		"ok": ok,
+		"error": None if ok else _describe(exception),
+		"exception": exception,
+	}
+
+
+def _chunks(seq, size):
+	for start in range(0, len(seq), size):
+		yield seq[start : start + size]
+
+
+def _token_kind(token):
+	"""Classify a stored token: 'fcm' | 'expo' | 'apns'."""
+	if token.startswith(_EXPO_PREFIXES):
+		return "expo"
+	if _APNS_TOKEN.match(token):
+		return "apns"
+	return "fcm"
+
+
+def _is_dead_token(exception):
+	"""True when FCM says the token can never succeed again."""
+	if exception is None or messaging is None:
+		return False
+	return isinstance(
+		exception, (messaging.UnregisteredError, messaging.SenderIdMismatchError)
+	)
+
+
+def _describe(exception):
+	if exception is None:
+		return "Unknown error"
+	name = type(exception).__name__
+	detail = str(exception) or ""
+	return "{}: {}".format(name, detail) if detail else name
 
 
 def _error(message, campaign_name=""):
