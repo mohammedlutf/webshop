@@ -15,10 +15,7 @@ except ImportError:  # firebase-admin is a bench-level dependency, not an app on
 # The Firebase service-account key lives next to the App Device Token doctype
 # (i.e. the same folder the app is deployed into). It authorises this server to
 # talk to FCM directly, so no FCM credentials ever need to be handed to Expo/EAS.
-_SERVICE_ACCOUNT_FILENAME = os.path.join(
-    frappe.get_site_path("private"),
-    "ecommerce-efd8b-firebase-adminsdk-fbsvc-94ee7d13d2.json"
-)
+_SERVICE_ACCOUNT_FILENAME = frappe.conf.get("fcm_service_account_path")
 # _SERVICE_ACCOUNT_FILENAME = "ecommerce-efd8b-firebase-adminsdk-fbsvc-94ee7d13d2.json"
 _SERVICE_ACCOUNT_HINT = "firebase-adminsdk"
 
