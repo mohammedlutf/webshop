@@ -6,6 +6,8 @@ import frappe
 from frappe import _
 from frappe.utils import cint, flt, nowdate
 
+from webshop.my_api import marketplace as mp
+
 
 def _settings():
 	"""The site's `Webshop Settings`, read once per request.
@@ -240,14 +242,66 @@ def _get_calculated_uoms(doc_item_code):
 	return _uom_prices_for_items([doc_item_code]).get(doc_item_code, [])
 
 
+def _ensure_cart_shops(items):
+	"""Make sure every cart line knows its shop, once.
+
+	Old carts (and lines written before the marketplace migration) have no
+	`shop` key. They are resolved in one batched query and written back, so the
+	first multi-vendor checkout after the upgrade splits them correctly instead
+	of dumping everything into a phantom vendor.
+	"""
+	missing = [item for item in items if "shop" not in item]
+	if not missing:
+		return items
+	shop_map = mp.shops_for_item_codes([item["item_code"] for item in missing])
+	for item in missing:
+		item["shop"] = mp.resolve_item_shop(item["item_code"], shop_map)
+	_save_cart(items)
+	return items
+
+
+def _cart_groups(items):
+	"""Cart lines bucketed by shop, for per-vendor checkout and cart UI."""
+	by_shop = {}
+	for item in items:
+		by_shop.setdefault(item.get("shop") or "", []).append(item)
+
+	rows = []
+	for shop_name, lines in by_shop.items():
+		meta = mp.shop_public(shop_name) if shop_name else None
+		rows.append(
+			{
+				"shop": shop_name,
+				"shop_name": (meta or {}).get("shop_name") or "",
+				"logo": (meta or {}).get("logo") or "",
+				"is_platform": bool((meta or {}).get("is_platform")),
+				"items": lines,
+				"count": sum(flt(line["qty"]) for line in lines),
+				"subtotal": sum(flt(line["amount"]) for line in lines),
+			}
+		)
+	# Named shops first, alphabetically; the unnamed platform bucket last, so a
+	# vendor never lands below the default catch-all.
+	rows.sort(key=lambda row: (not row["shop"], row["shop_name"]))
+	return rows
+
+
 def get_cart_data():
 	items = _cart_items()
+	_ensure_cart_shops(items)
 	for item in items:
 		item.setdefault("uoms", _get_calculated_uoms(item["item_code"]))
 	total = sum(flt(item["amount"]) for item in items)
 	settings = _settings()
 	currency = frappe.db.get_value("Company", settings.company, "default_currency") or "YER"
-	return {"items": items, "total": total, "grand_total": total, "currency": currency, "count": sum(flt(item["qty"]) for item in items)}
+	return {
+		"items": items,
+		"total": total,
+		"grand_total": total,
+		"currency": currency,
+		"count": sum(flt(item["qty"]) for item in items),
+		"groups": _cart_groups(items),
+	}
 
 
 def _get_shipping_address(customer, address, phone=None):
@@ -314,6 +368,8 @@ def _item_fields():
 	]
 	if frappe.get_meta("Website Item").has_field("blurhash"):
 		fields.append("blurhash")
+	if frappe.get_meta("Website Item").has_field("marketplace_shop"):
+		fields.append("marketplace_shop")
 	return fields
 
 
@@ -326,6 +382,9 @@ def _decorate(item, uoms=None):
 	item.currency = price.get("currency", "")
 	item.uoms = uoms
 	item.in_stock = bool(item.on_backorder or item.website_warehouse)
+	# The owning shop travels with every catalogue row: cards show the badge and
+	# checkout splits the cart by it. No-op (shop = None) before the migration.
+	mp.decorate_with_shop(item)
 	return item
 
 
@@ -347,7 +406,7 @@ def _website_groups():
 	return cached
 
 
-def _catalog_filters(item_group=None, search=None):
+def _catalog_filters(item_group=None, search=None, shop=None):
 	allowed_groups = _website_groups()
 
 	filters = {"published": 1, "has_variants": ["in", [0, None]]}
@@ -370,6 +429,15 @@ def _catalog_filters(item_group=None, search=None):
 		search_fields = ["web_item_name", "item_name", "item_code", "description", "short_description"]
 		or_filters = [{field: ["like", f"%{search}%"]} for field in search_fields]
 
+	# A shop filter naming a shop that does not exist (or is not approved)
+	# answers with an empty page, the same rule as a hidden item group: a stale
+	# deep link must not become a window into the whole catalogue.
+	if shop and mp.has_shop_field():
+		if frappe.db.exists("Marketplace Shop", {"name": shop, "status": "Approved"}):
+			filters["marketplace_shop"] = shop
+		else:
+			filters["name"] = ["in", []]
+
 	# Applied here rather than after the rows come back, because this filter is
 	# shared by `get_catalog` and `get_catalog_count`. Dropping zero-rated rows
 	# in Python would leave the count describing a set the listing no longer
@@ -384,19 +452,34 @@ def _catalog_filters(item_group=None, search=None):
 
 
 
-def get_catalog(item_group=None, search=None, limit=24, start=0):
-	filters, or_filters = _catalog_filters(item_group, search)
+def _catalog_order_by(shop=None):
+	"""The `ORDER BY` for one catalogue page.
+
+	`ranking` is the merchant's site-wide ordering control and stays that way.
+	A vendor's own ranking is deliberately never written there — otherwise any
+	vendor could push a product to the top of the whole catalogue by editing it
+	— so it lives in `vendor_ranking` and is applied *only* when the listing is
+	already scoped to that vendor's shop (the shop page, or the catalogue
+	filtered by `shop`). The unfiltered catalogue is unaffected by it.
+	"""
+	if shop and mp.has_vendor_ranking_field():
+		return "vendor_ranking desc, modified desc"
+	return "ranking desc, modified desc"
+
+
+def get_catalog(item_group=None, search=None, limit=24, start=0, shop=None):
+	filters, or_filters = _catalog_filters(item_group, search, shop)
 	items = frappe.get_all(
 		"Website Item", filters=filters, or_filters=or_filters, fields=_item_fields(),
-		order_by="ranking desc, modified desc", limit_start=max(cint(start), 0), limit_page_length=min(cint(limit) or 24, 100),
+		order_by=_catalog_order_by(shop), limit_start=max(cint(start), 0), limit_page_length=min(cint(limit) or 24, 100),
 	)
 	# One batched UOM/price resolution for the whole page (was: per row).
 	uom_map = _uom_prices_for_items([row.item_code for row in items])
 	return [_decorate(item, uom_map.get(item.item_code)) for item in items]
 
 
-def get_catalog_count(item_group=None, search=None):
-	filters, or_filters = _catalog_filters(item_group, search)
+def get_catalog_count(item_group=None, search=None, shop=None):
+	filters, or_filters = _catalog_filters(item_group, search, shop)
 	if or_filters:
 		# `frappe.db.count` cannot take `or_filters`, and materialising every
 		# matching name just to call len() is O(n) memory for a single number.
@@ -524,14 +607,15 @@ def get_group_hierarchy():
 
 @frappe.whitelist(allow_guest=True)
 def webshop_settings():
-	"""The storefront's feature switches, for the mobile app.
+	"""The storefront's public configuration, for the mobile app.
 
 	`allow_guest` on purpose: a product page is public, so whether reviews and
 	recommendations are shown cannot be a privileged read. Making it privileged
 	would mean a guest sees a different product page than a signed-in shopper,
 	which is worse than the two booleans being public.
 
-	Only these two switches leave the server. The rest of `Webshop Settings`
+	Only these switches and the home-page configuration (the shop rail, the
+	advertising banners) leave the server. The rest of `Webshop Settings`
 	(company, price list, shipping account, default delivery rate) is back-office
 	configuration and must never reach a client.
 	"""
@@ -539,7 +623,59 @@ def webshop_settings():
 	return {
 		"enable_reviews": bool(settings.enable_reviews),
 		"enable_recommendations": bool(settings.enable_recommendations),
+		"show_shops_on_homescreen": _show_shops_on_homescreen(settings),
+		"homepage_ads": _homepage_ads(settings),
 	}
+
+
+def _show_shops_on_homescreen(settings=None):
+	"""Whether the app's home screen draws the marketplace shop rail.
+
+	An unset — or, on a site that has not migrated yet, missing — checkbox means
+	"show". Showing the rail is what the home screen did before the setting
+	existed, so a `None` here must not silently empty a section the merchant
+	never turned off.
+	"""
+	settings = settings if settings is not None else _settings()
+	value = settings.get("show_shops_on_homescreen")
+	if value is None:
+		return True
+	return bool(cint(value))
+
+
+def _homepage_ads(settings=None):
+	"""The merchant's home-hero banners, in the order they were entered.
+
+	Read through `.get()` rather than attribute access so a site that has not
+	migrated yet — where the child table does not exist — answers "no banners"
+	and the app keeps its built-in hero, instead of raising on the home screen.
+
+	`image` goes out as the relative `/files/...` path Frappe stores; the client
+	resolves it against its configured API origin, which is what lets a
+	development build point at one server and production at another.
+	"""
+	settings = settings if settings is not None else _settings()
+	ads = []
+	for row in settings.get("homepage_advertising_images") or []:
+		# A disabled row is a banner the merchant wants to keep for later, so it
+		# is skipped rather than deleted. A row with no image is dropped too:
+		# `image` is mandatory in the form, but an import or a direct write can
+		# still produce one, and a banner with nothing to draw is dead space.
+		if not cint(row.get("enabled", 1)):
+			continue
+		image = (row.get("image") or "").strip()
+		if not image:
+			continue
+		ads.append(
+			{
+				"image": image,
+				"title": row.get("title") or "",
+				"item_group": row.get("item_group") or "",
+				"item_code": row.get("item_code") or "",
+				"url": row.get("url") or "",
+			}
+		)
+	return ads
 
 
 def _storefront_recommended(item_doc):
@@ -571,6 +707,7 @@ def _storefront_recommended(item_doc):
 			details.setdefault(row.item_code, row)
 
 	uom_map = _uom_prices_for_items([r.item_code for r in rows if r.get("item_code")])
+	shop_map = mp.shops_for_item_codes([r.item_code for r in rows if r.get("item_code")])
 
 	recommended = []
 	for rec in rows:
@@ -578,6 +715,12 @@ def _storefront_recommended(item_doc):
 		detail = details.get(rec.get("item_code"))
 		if detail:
 			rec_dict.update(detail)
+
+		rec_dict["shop"] = (
+			mp.shop_public(shop_map.get(rec.get("item_code")) or mp.platform_shop_name())
+			if mp.has_shop_field()
+			else None
+		)
 
 		uoms = uom_map.get(rec.get("item_code")) or []
 		rec_dict["uoms"] = uoms
@@ -702,8 +845,11 @@ def update_website_context(context):
 
 
 @frappe.whitelist(allow_guest=True)
-def catalog(item_group=None, search=None, limit=24, offset=0):
-	return {"items": get_catalog(item_group, search, limit, offset), "groups": get_groups()}
+def catalog(item_group=None, search=None, limit=24, offset=0, shop=None):
+	return {
+		"items": get_catalog(item_group, search, limit, offset, shop=shop),
+		"groups": get_groups(),
+	}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -752,7 +898,7 @@ def cart(item_code=None, qty=0, uom=None):
 			line["qty"] += flt(qty)
 			line["amount"] = flt(line["qty"]) * flt(price.price_list_rate)
 		else:
-			items.append({"item_code": item.item_code, "item_name": item.item_name, "qty": flt(qty), "uom": selected_uom, "rate": flt(price.price_list_rate), "amount": flt(qty) * flt(price.price_list_rate), "warehouse": item.website_warehouse, "uoms": _get_calculated_uoms(item_code), "image": item.website_image})
+			items.append({"item_code": item.item_code, "item_name": item.item_name, "qty": flt(qty), "uom": selected_uom, "rate": flt(price.price_list_rate), "amount": flt(qty) * flt(price.price_list_rate), "warehouse": item.website_warehouse, "uoms": _get_calculated_uoms(item_code), "image": item.website_image, "shop": mp.resolve_item_shop(item_code)})
 		_save_cart(items)
 	return get_cart_data()
 
@@ -864,8 +1010,82 @@ def _resolve_order_contact(customer):
 	return frappe.db.get_value("Contact", name, ["name", "mobile_no"], as_dict=True)
 
 
+def _resolve_delivery_plan(address_name, shop_names, settings):
+	"""Delivery charges per shop for one checkout, plus the total.
+
+	Per-vendor rule: a shop carrying its own `delivery_rate` charges that rate
+	on its own orders. Shops without one fall back to the legacy chain (the
+	address's rate, then the shop-wide default) — and that fallback is billed
+	ONCE for the whole checkout, on the first such shop. It prices delivery to
+an address, not a per-vendor toll: multiplying it by the number of vendors
+	would silently raise the customer's total every time they added a second
+	shop to the cart.
+
+	Returns {lines: [{shop, charges, source}], total, shipping_account}.
+	"""
+	shipping_account = settings.shipping_account or ""
+	plan = []
+	shared = None
+	shared_used = False
+
+	for shop_name in shop_names:
+		rate = 0.0
+		if shop_name and frappe.db.exists("DocType", "Marketplace Shop"):
+			rate = flt(frappe.db.get_value("Marketplace Shop", shop_name, "delivery_rate"))
+		if rate > 0:
+			plan.append({"shop": shop_name, "charges": round(rate, 2), "source": "shop"})
+			continue
+
+		if shared is None:
+			shared = _resolve_delivery_charges(address_name, settings)
+		if not shared_used and shared["charges"] > 0:
+			shared_used = True
+			plan.append(
+				{"shop": shop_name, "charges": shared["charges"], "source": shared["source"]}
+			)
+		else:
+			plan.append(
+				{
+					"shop": shop_name,
+					"charges": 0.0,
+					"source": "included" if shared_used else "free",
+				}
+			)
+
+	return {
+		"lines": plan,
+		"total": round(sum(row["charges"] for row in plan), 2),
+		"shipping_account": shipping_account,
+	}
+
+
+def _commission_rate_for_shop(shop_name, settings):
+	"""Commission for a shop at order time: the shop's rate, else the site default."""
+	if not shop_name or not frappe.db.exists("DocType", "Marketplace Shop"):
+		return 0.0
+	rate = frappe.db.get_value("Marketplace Shop", shop_name, "commission_rate")
+	if rate is None:
+		rate = settings.get("default_commission_rate")
+	return flt(rate)
+
+
 @frappe.whitelist(methods=["POST"])
-def submit_order(address=None, phone=None, notes=None, delivery_charges=None, shipping_account=None):  # new: the last two
+def submit_order(address=None, phone=None, notes=None, delivery_charges=None, shipping_account=None):  # noqa: E501
+	"""Checkout: one submitted Sales Order per vendor shop, one shared group id.
+
+	The cart is bucketed by each line's shop and one Sales Order is created per
+	bucket, all carrying the same `marketplace_order_group` — that id is what
+	the app renders as "one order" and what cancel/reorder resolve back into
+	per-vendor orders. A cart from a single shop degenerates to exactly the
+	one-order checkout this replaced.
+
+	The whole request runs in a single Frappe transaction: if the third of five
+	vendor orders fails, the first two roll back with it, so a customer can
+	never be left having half-ordered.
+
+	Client-supplied figures (`delivery_charges`, the legacy argument) are never
+	trusted; the plan above is what gets charged.
+	"""
 	if frappe.session.user == "Guest":
 		frappe.throw(_("Please log in before submitting an order."), frappe.AuthenticationError)
 	settings = _settings()
@@ -874,67 +1094,125 @@ def submit_order(address=None, phone=None, notes=None, delivery_charges=None, sh
 	items = _cart_items()
 	if not items:
 		frappe.throw(_("Your cart is empty."))
+	_ensure_cart_shops(items)
+
 	from webshop.webshop.shopping_cart.cart import get_party
 	customer = get_party()
-	order = frappe.get_doc({"doctype": "Sales Order", "customer": customer.name, "company": settings.company, "selling_price_list": settings.price_list, "order_type": "Shopping Cart", "terms": notes or "Cash on delivery", "items": [{"item_code": item["item_code"], "item_name": item["item_name"], "qty": item["qty"], "uom": item["uom"], "rate": item["rate"], "warehouse": item["warehouse"]} for item in items]})
-	order.shipping_address_name = _get_shipping_address(customer, address, phone)
+	shipping_address = _get_shipping_address(customer, address, phone)
 	contact = _resolve_order_contact(customer)
-	if contact:
-		order.contact_person = contact.name
-		order.contact_display = customer.customer_name or customer.name
-		order.contact_mobile = contact.mobile_no
-	order.flags.ignore_permissions = True
 
-	# --- delivery charge, new ---
-	# Resolved from the SAVED address, not the incoming `address` argument:
-	# _get_shipping_address may have just created a fresh Address, and a brand new
-	# one has no per-address rate, so it correctly falls back to the shop default.
-	delivery = _resolve_delivery_charges(order.shipping_address_name, settings)
+	by_shop = {}
+	for item in items:
+		by_shop.setdefault(item.get("shop") or "", []).append(item)
+	shop_names = list(by_shop.keys())
 
-	# The app sends its own figures so the payload is explicit and the
-	# confirmation screen can echo them. They are NOT trusted — a client-supplied
-	# amount is not evidence of what the customer owes. A disagreement is logged
-	# because it means the quoted price no longer matches the charged price.
-	if delivery_charges is not None and flt(delivery_charges) != delivery["charges"]:
+	plan = _resolve_delivery_plan(shipping_address, shop_names, settings)
+	delivery_by_shop = {row["shop"]: row for row in plan["lines"]}
+
+	# The app may echo what it quoted at checkout. A mismatch means the price
+	# moved between quote and submit — logged, never trusted.
+	if delivery_charges is not None and flt(delivery_charges) != plan["total"]:
 		frappe.logger("ecommerce").warning(
-			"Delivery charge mismatch on %s: client=%s server=%s",
-			order.shipping_address_name, delivery_charges, delivery["charges"]
+			"Delivery charge mismatch for %s: client=%s server=%s",
+			shipping_address, delivery_charges, plan["total"],
 		)
 
-	if delivery["charges"] > 0:
-		if not delivery["shipping_account"]:
-			frappe.throw(_("Set a shipping account in Webshop Settings before accepting delivery charges."))
-		# Document.append, NOT order.taxes.append(...): child tables hold Document
-		# objects, and appending a plain dict leaves a raw dict in the list that
-		# _set_defaults then calls .is_new() on.
-		order.append("taxes", {
-			"charge_type": "Actual",
-			"account_head": delivery["shipping_account"],
-			"description": _("Delivery Charges"),
-			# `rate`, not `tax_amount`. tax_amount is a read-only computed field on
-			# Sales Taxes and Charges, so setting it stores nothing and the charge
-			# silently becomes 0.
-			"tax_amount": delivery["charges"],
-			"cost_center": frappe.db.get_value("Company", settings.company, "cost_center"),
-			"included_in_print_rate": 0,
-		})
+	group = "grp-" + frappe.generate_hash(length=16)
+	so_meta = frappe.get_meta("Sales Order")
+	cost_center = frappe.db.get_value("Company", settings.company, "cost_center")
 
-	order.set_missing_values()
-	order.insert(ignore_permissions=True)
+	created = []
+	grand_total = 0.0
+	for shop_name in shop_names:
+		lines = by_shop[shop_name]
+		order = frappe.get_doc(
+			{
+				"doctype": "Sales Order",
+				"customer": customer.name,
+				"company": settings.company,
+				"selling_price_list": settings.price_list,
+				"order_type": "Shopping Cart",
+				"terms": notes or "Cash on delivery",
+				"items": [
+					{
+						"item_code": line["item_code"],
+						"item_name": line["item_name"],
+						"qty": line["qty"],
+						"uom": line["uom"],
+						"rate": line["rate"],
+						"warehouse": line["warehouse"],
+					}
+					for line in lines
+				],
+			}
+		)
+		if so_meta.has_field("marketplace_order_group"):
+			order.marketplace_order_group = group
+		if so_meta.has_field("marketplace_shop"):
+			order.marketplace_shop = shop_name or None
 
-	# A Taxes and Charges template can rebuild `taxes` and drop the manual row,
-	# which would ship the order with no delivery fee at all. Caught here rather
-	# than discovered at invoicing.
+		order.shipping_address_name = shipping_address
+		if contact:
+			order.contact_person = contact.name
+			order.contact_display = customer.customer_name or customer.name
+			order.contact_mobile = contact.mobile_no
 
-	order.submit()
+		delivery = delivery_by_shop.get(shop_name) or {"charges": 0.0, "source": "free"}
+		if delivery["charges"] > 0:
+			if not plan["shipping_account"]:
+				frappe.throw(
+					_("Set a shipping account in Webshop Settings before accepting delivery charges.")
+				)
+			# Document.append, NOT order.taxes.append: child tables hold Document
+			# objects, and a plain dict breaks _set_defaults.
+			order.append(
+				"taxes",
+				{
+					"charge_type": "Actual",
+					"account_head": plan["shipping_account"],
+					"description": _("Delivery Charges"),
+					"tax_amount": delivery["charges"],
+					"cost_center": cost_center,
+					"included_in_print_rate": 0,
+				},
+			)
+
+		# Commission is snapshotted on the order, not derived at payout time:
+		# a rate change next month must not re-price what was owed this month.
+		items_total = sum(flt(line["amount"]) for line in lines)
+		if so_meta.has_field("marketplace_commission_rate"):
+			rate = _commission_rate_for_shop(shop_name, settings)
+			order.marketplace_commission_rate = rate
+			order.marketplace_commission_amount = round(items_total * rate / 100.0, 2)
+
+		order.flags.ignore_permissions = True
+		order.set_missing_values()
+		order.insert(ignore_permissions=True)
+		order.submit()
+
+		grand_total += flt(order.grand_total)
+		shop_meta = mp.shop_public(shop_name) if shop_name else None
+		created.append(
+			{
+				"name": order.name,
+				"shop": shop_name or "",
+				"shop_name": (shop_meta or {}).get("shop_name") or "",
+				"logo": (shop_meta or {}).get("logo") or "",
+				"is_platform": bool((shop_meta or {}).get("is_platform")),
+				"delivery_charges": delivery["charges"],
+				"delivery_source": delivery["source"],
+				"items_total": round(items_total, 2),
+				"grand_total": flt(order.grand_total),
+			}
+		)
+
 	_save_cart([])
 	return {
-		"name": order.name,
+		"group": group,
+		"orders": created,
+		"grand_total": round(grand_total, 2),
+		"delivery_charges": plan["total"],
 		"payment_method": "Cash on Delivery",
-		"delivery_charges": delivery["charges"],
-		"shipping_account": delivery["shipping_account"],
-		"delivery_source": delivery["source"],
-		"grand_total": flt(order.grand_total),
 	}
 
 
@@ -949,39 +1227,186 @@ def reviews(website_item, rating, review_title, comment):
 	return review.name
 
 
+_ORDER_LIST_FIELDS = ["name", "transaction_date", "status", "docstatus", "grand_total", "currency", "creation"]
+
+
+def _so_marketplace_fields():
+	"""Marketplace columns present on this site's Sales Order."""
+	meta = frappe.get_meta("Sales Order")
+	return [
+		field
+		for field in (
+			"marketplace_order_group",
+			"marketplace_shop",
+			"vendor_order_status",
+			"marketplace_commission_rate",
+			"marketplace_commission_amount",
+		)
+		if meta.has_field(field)
+	]
+
+
+def _order_display_status(row):
+	"""Customer-facing status of one vendor order."""
+	if cint(row.get("docstatus")) == 2 or row.get("vendor_order_status") == "Cancelled":
+		return "Cancelled"
+	if row.get("status") == "Completed" or row.get("vendor_order_status") == "Delivered":
+		return "Delivered"
+	vendor_status = row.get("vendor_order_status")
+	if vendor_status in ("Ready", "Processing"):
+		return vendor_status
+	return "New"
+
+
+def _unit_summary(order_units):
+	"""One status for the whole unit, honest to the slowest live vendor order."""
+	statuses = [order["status"] for order in order_units]
+	if statuses and all(status == "Cancelled" for status in statuses):
+		return "Cancelled"
+	live = [status for status in statuses if status != "Cancelled"]
+	if live and all(status == "Delivered" for status in live):
+		return "Delivered"
+	# The most advanced stage *every* live order has reached.
+	for stage in ("Ready", "Processing"):
+		if all(status in ("Delivered", stage) for status in live):
+			return stage
+	return "New"
+
+
+def _unit_entry(order_rows, items_by_order, delivery_by_order):
+	"""One customer-facing order: a vendor group, or a lone legacy order.
+
+	The flat keys (`name`, `status`, `grand_total`, `items`, ...) mirror what a
+	single Sales Order used to return, so screens written for the single-shop
+	shape keep rendering while `orders` carries the per-vendor breakdown.
+	"""
+	first = order_rows[0]
+	group_id = first.get("marketplace_order_group") or ""
+
+	vendor_orders = []
+	for row in order_rows:
+		shop_meta = mp.shop_public(row.get("marketplace_shop")) if row.get("marketplace_shop") else None
+		vendor_orders.append(
+			{
+				"name": row.name,
+				"shop": row.get("marketplace_shop") or "",
+				"shop_name": (shop_meta or {}).get("shop_name") or "",
+				"logo": (shop_meta or {}).get("logo") or "",
+				"is_platform": bool((shop_meta or {}).get("is_platform")),
+				"status": _order_display_status(row),
+				"erp_status": row.status,
+				"vendor_order_status": row.get("vendor_order_status") or "",
+				"grand_total": flt(row.grand_total),
+				"delivery_charges": flt(delivery_by_order.get(row.name)),
+				"items": items_by_order.get(row.name, []),
+			}
+		)
+
+	items = [item for row in order_rows for item in items_by_order.get(row.name, [])]
+	return {
+		"name": group_id or first.name,
+		"group": group_id or None,
+		"is_group": len(order_rows) > 1,
+		# Kept so a client written for the single-order shape can still decide
+		# whether a unit may be cancelled without reading the per-vendor rows.
+		"docstatus": first.get("docstatus"),
+		"transaction_date": first.transaction_date,
+		"status": _unit_summary(vendor_orders),
+		"grand_total": sum(order["grand_total"] for order in vendor_orders),
+		"currency": first.currency,
+		"shops": [order["shop_name"] for order in vendor_orders if order["shop_name"]],
+		"items": items,
+		"orders": vendor_orders,
+		"count": sum(flt(item.get("qty")) for item in items),
+	}
+
+
 @frappe.whitelist()
 def orders(start: int = 0, page_length: int = 12):
-	"""Return one page of the current customer's sales orders, newest first."""
+	"""One page of the customer's orders, newest first.
+
+	With the marketplace fields present, one checkout of N vendor orders is ONE
+	unit here (keyed by its group id), so a page boundary can never cut a
+	customer's order in half. Legacy single-order rows (no group) are units of
+	their own and page first, keeping their positions stable as new grouped
+	checkouts accumulate.
+	"""
 	user = frappe.session.user
 	if user == "Guest":
 		frappe.throw(_("Please log in to view your orders."), frappe.PermissionError)
 
-	from webshop.webshop.shopping_cart.cart import get_party    
+	from webshop.webshop.shopping_cart.cart import get_party
 
-	customer = get_party()   # <- keep your existing customer lookup
+	customer = get_party()
 	if not customer:
 		return {"orders": [], "total": 0, "start": 0, "page_length": 0, "has_more": False}
 
 	start = max(cint(start) or 0, 0)
 	page_length = min(max(cint(page_length) or 12, 1), 100)
 
-	filters = {"customer": customer.name, "docstatus": ["<", 2]}
-	total = frappe.db.count("Sales Order", filters)
+	base = {"customer": customer.name, "docstatus": ["<", 2]}
+	grouped = "marketplace_order_group" in _so_marketplace_fields()
+	fields = _ORDER_LIST_FIELDS + _so_marketplace_fields()
 
-	order_rows = frappe.get_all(
-		"Sales Order",
-		filters=filters,
-		fields=["name", "transaction_date", "status", "docstatus", "grand_total", "currency"],
-		# `transaction_date` is date-only, so orders placed the same day used to
-		# come back in arbitrary order. `creation` breaks the tie.
-		order_by="transaction_date desc, creation desc, name desc",
-		limit_start=start,
-		limit_page_length=page_length,
-	)
+	if grouped:
+		total_singles = frappe.db.count(
+			"Sales Order", {**base, "marketplace_order_group": ["is", "not set"]}
+		)
+		group_rows = frappe.get_all(
+			"Sales Order",
+			filters={**base, "marketplace_order_group": ["is", "set"]},
+			fields=["marketplace_order_group", "max(creation) as last_creation"],
+			group_by="marketplace_order_group",
+			order_by="last_creation desc",
+			limit_page_length=0,
+		)
+	else:
+		total_singles = frappe.db.count("Sales Order", base)
+		group_rows = []
 
-	# One query for the whole page instead of one per order (the old N+1 loop).
+	total = total_singles + len(group_rows)
+
+	single_take = max(0, min(start + page_length, total_singles) - start)
+	groups_start = max(0, start - total_singles)
+	groups_take = max(0, page_length - single_take)
+
+	page_rows = []
+	if single_take:
+		single_filters = dict(base)
+		if grouped:
+			single_filters["marketplace_order_group"] = ["is", "not set"]
+		page_rows.extend(
+			frappe.get_all(
+				"Sales Order",
+				filters=single_filters,
+				fields=fields,
+				order_by="transaction_date desc, creation desc, name desc",
+				limit_start=start,
+				limit_page_length=single_take,
+			)
+		)
+
+	selected_groups = [
+		row.marketplace_order_group
+		for row in group_rows[groups_start : groups_start + groups_take]
+	]
+	grouped_rows = {}
+	if selected_groups:
+		for row in frappe.get_all(
+			"Sales Order",
+			filters={**base, "marketplace_order_group": ["in", selected_groups]},
+			fields=fields,
+			order_by="transaction_date asc, creation asc",
+		):
+			grouped_rows.setdefault(row.marketplace_order_group, []).append(row)
+
+	units = [[row] for row in page_rows]
+	units.extend(grouped_rows.get(group_id, []) for group_id in selected_groups)
+
+	# One items query and one taxes query for the whole page, not per order.
+	order_names = [row.name for unit in units for row in unit]
 	items_by_order = {}
-	order_names = [row.name for row in order_rows]
+	delivery_by_order = {}
 	if order_names:
 		for item in frappe.get_all(
 			"Sales Order Item",
@@ -989,20 +1414,36 @@ def orders(start: int = 0, page_length: int = 12):
 			fields=["parent", "item_name", "qty", "uom", "rate", "amount"],
 			order_by="idx asc",
 		):
-			items_by_order.setdefault(item.parent, []).append({
-				"item_name": item.item_name,
-				"qty": item.qty,
-				"uom": item.uom,
-				"rate": item.rate,
-				"amount": item.amount,
-			})
+			items_by_order.setdefault(item.parent, []).append(
+				{
+					"item_name": item.item_name,
+					"qty": item.qty,
+					"uom": item.uom,
+					"rate": item.rate,
+					"amount": item.amount,
+				}
+			)
 
-	for row in order_rows:
-		row["items"] = items_by_order.get(row.name, [])
+		shipping_account = _settings().shipping_account
+		for tax in frappe.get_all(
+			"Sales Taxes and Charges",
+			filters={"parent": ["in", order_names], "charge_type": "Actual"},
+			fields=["parent", "tax_amount", "account_head", "description"],
+			limit_page_length=0,
+		):
+			is_delivery = (shipping_account and tax.account_head == shipping_account) or (
+				"delivery" in (tax.description or "").lower()
+			)
+			if is_delivery:
+				delivery_by_order[tax.parent] = flt(delivery_by_order.get(tax.parent)) + flt(
+					tax.tax_amount
+				)
 
-	loaded = len(order_rows)
+	entries = [_unit_entry(unit, items_by_order, delivery_by_order) for unit in units if unit]
+
+	loaded = single_take + len(selected_groups)
 	return {
-		"orders": order_rows,
+		"orders": entries,
 		"total": total,
 		"start": start,
 		"page_length": page_length,
@@ -1010,47 +1451,100 @@ def orders(start: int = 0, page_length: int = 12):
 	}
 
 
+def _order_unit_names(order_name, customer_name):
+	"""Every open Sales Order the customer means by `order_name`.
+
+	`orders()` hands the app a group id as the unit's `name`; an old client may
+	still send one concrete order from inside the group. Both resolve to the
+	full set of that customer's open orders in the unit, so cancel and reorder
+	always act on the whole checkout, never on an arbitrary vendor's slice.
+	"""
+	group = None
+	if frappe.get_meta("Sales Order").has_field("marketplace_order_group"):
+		group = frappe.db.get_value("Sales Order", order_name, "marketplace_order_group")
+		if not group and str(order_name).startswith("grp-"):
+			group = order_name
+	if group:
+		names = frappe.get_all(
+			"Sales Order",
+			filters={
+				"marketplace_order_group": group,
+				"customer": customer_name,
+				"docstatus": ["<", 2],
+			},
+			pluck="name",
+		)
+		if names:
+			return names
+	return [order_name]
+
+
 @frappe.whitelist(methods=["POST"])
 def cancel_order(order_name):
+	"""Cancel one order — or every vendor order of a group checkout.
+
+	A group is cancelled as a unit, but a vendor order that can no longer be
+	cancelled (already delivered) is skipped rather than aborting the rest: the
+	customer's intent is to stop what can still be stopped.
+	"""
 	if frappe.session.user == "Guest":
 		frappe.throw(_("Please log in to manage your orders."), frappe.AuthenticationError)
 	from webshop.webshop.shopping_cart.cart import get_party
 	customer = get_party()
-	order = frappe.get_doc("Sales Order", order_name)
-	if order.customer != customer.name:
-		frappe.throw(_("You cannot manage this order."), frappe.PermissionError)
-	if order.docstatus != 1 or order.status in ("Completed", "Closed", "Cancelled"):
+
+	targets = _order_unit_names(order_name, customer.name)
+	cancelled = []
+	for name in targets:
+		order = frappe.get_doc("Sales Order", name)
+		if order.customer != customer.name:
+			frappe.throw(_("You cannot manage this order."), frappe.PermissionError)
+		if order.docstatus != 1 or order.status in ("Completed", "Closed", "Cancelled"):
+			continue
+		order.flags.ignore_permissions = True
+		order.cancel()
+		cancelled.append(name)
+
+	if not cancelled:
 		frappe.throw(_("This order can no longer be cancelled."))
-	order.flags.ignore_permissions = True
-	order.cancel()
-	return {"name": order.name, "status": order.status}
+	return {"name": order_name, "status": "Cancelled", "cancelled": cancelled}
 
 
 @frappe.whitelist(methods=["POST"])
 def reorder_order(order_name):
+	"""Refill the cart from an order — a whole group, or one legacy order."""
 	if frappe.session.user == "Guest":
 		frappe.throw(_("Please log in to reorder."), frappe.AuthenticationError)
 	from webshop.webshop.shopping_cart.cart import get_party
 	customer = get_party()
-	order = frappe.get_doc("Sales Order", order_name)
-	if order.customer != customer.name:
-		frappe.throw(_("You cannot manage this order."), frappe.PermissionError)
+
+	targets = [
+		frappe.get_doc("Sales Order", name)
+		for name in _order_unit_names(order_name, customer.name)
+	]
+	for order in targets:
+		if order.customer != customer.name:
+			frappe.throw(_("You cannot manage this order."), frappe.PermissionError)
+
 	items = _cart_items()
-	for source in order.items:
-		item = frappe.db.get_value("Website Item", {"item_code": source.item_code, "published": 1}, ["item_code", "item_name", "stock_uom", "website_warehouse"], as_dict=True)
-		if not item:
-			continue
-		uom = source.uom or item.stock_uom
-		price = _price(source.item_code, uom)
-		if not price.price_list_rate:
-			continue
-		line = next((line for line in items if line["item_code"] == source.item_code and line["uom"] == uom), None)
-		if line:
-			line["qty"] += flt(source.qty)
-			line["rate"] = flt(price.price_list_rate)
-			line["amount"] = flt(line["qty"]) * flt(price.price_list_rate)
-		else:
-			items.append({"item_code": item.item_code, "item_name": item.item_name, "qty": flt(source.qty), "uom": uom, "rate": flt(price.price_list_rate), "amount": flt(source.qty) * flt(price.price_list_rate), "warehouse": item.website_warehouse, "uoms": _get_calculated_uoms(source.item_code)})
+	shop_map = mp.shops_for_item_codes(
+		[source.item_code for order in targets for source in order.items]
+	)
+	for order in targets:
+		for source in order.items:
+			item = frappe.db.get_value("Website Item", {"item_code": source.item_code, "published": 1}, ["item_code", "item_name", "stock_uom", "website_warehouse"], as_dict=True)
+			if not item:
+				continue
+			uom = source.uom or item.stock_uom
+			price = _price(source.item_code, uom)
+			if not price.price_list_rate:
+				continue
+			line = next((line for line in items if line["item_code"] == source.item_code and line["uom"] == uom), None)
+			if line:
+				line["qty"] += flt(source.qty)
+				line["rate"] = flt(price.price_list_rate)
+				line["amount"] = flt(line["qty"]) * flt(price.price_list_rate)
+			else:
+				items.append({"item_code": item.item_code, "item_name": item.item_name, "qty": flt(source.qty), "uom": uom, "rate": flt(price.price_list_rate), "amount": flt(source.qty) * flt(price.price_list_rate), "warehouse": item.website_warehouse, "uoms": _get_calculated_uoms(source.item_code), "shop": mp.resolve_item_shop(source.item_code, shop_map)})
 	_save_cart(items)
 	return get_cart_data()
 
@@ -1262,9 +1756,14 @@ def _resolve_delivery_charges(address_name=None, settings=None):
 
 @frappe.whitelist()
 def delivery_estimate(address=None):
-	"""Delivery charge for the cart summary. Read-only."""
+	"""Delivery charge for the cart, per vendor group. Read-only.
+
+	The response carries both the legacy total (`delivery_charges`) and the
+	per-shop breakdown (`groups`), computed by the same plan that checkout
+	charges, so the cart screen and `submit_order` can never disagree.
+	"""
 	if frappe.session.user == "Guest":
-		return {"delivery_charges": 0, "source": "free", "shipping_account": ""}
+		return {"delivery_charges": 0, "source": "free", "shipping_account": "", "groups": []}
 
 	from webshop.webshop.shopping_cart.cart import get_party
 	customer = get_party()
@@ -1281,4 +1780,25 @@ def delivery_estimate(address=None):
 		if address not in owned:
 			address = None
 
-	return _resolve_delivery_charges(address, _settings())	
+	cart = get_cart_data()
+	plan = _resolve_delivery_plan(address, [group["shop"] for group in cart["groups"]], _settings())
+	by_shop = {row["shop"]: row for row in plan["lines"]}
+	for group in cart["groups"]:
+		line = by_shop.get(group["shop"]) or {"charges": 0.0, "source": "free"}
+		group["delivery_charges"] = line["charges"]
+		group["delivery_source"] = line["source"]
+
+	total = plan["total"]
+	if total <= 0:
+		source = "free"
+	elif any(row["source"] == "shop" for row in plan["lines"]):
+		source = "shop"
+	else:
+		source = next((row["source"] for row in plan["lines"] if row["charges"] > 0), "free")
+
+	return {
+		"delivery_charges": total,
+		"source": source,
+		"shipping_account": plan["shipping_account"],
+		"groups": cart["groups"],
+	}	

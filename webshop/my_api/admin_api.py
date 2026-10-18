@@ -863,6 +863,12 @@ def admin_reference_data():
 def admin_item_payload(item_code=None):
 	"""Everything the editor needs for one product, in one round trip."""
 	_require_admin()
+	return _item_payload(item_code)
+
+
+def _item_payload(item_code=None):
+	"""The payload itself. Ungated so vendor-scoped callers can reuse it after
+	performing their own ownership check."""
 	item_code = (item_code or "").strip()
 	if not item_code or not frappe.db.exists("Item", item_code):
 		frappe.throw(_("Item not found."), frappe.DoesNotExistError)
@@ -958,6 +964,36 @@ def admin_update_item(
 	told-together page quietly erasing the product description.
 	"""
 	_require_admin()
+	return _update_item(
+		item_code=item_code,
+		item_name=item_name,
+		item_group=item_group,
+		short_description=short_description,
+		web_long_description=web_long_description,
+		ranking=ranking,
+		published=published,
+		image_base64=image_base64,
+		image_name=image_name,
+		uoms_json=uoms_json,
+		recommended_json=recommended_json,
+	)
+
+
+def _update_item(
+	item_code=None,
+	item_name=None,
+	item_group=None,
+	short_description=None,
+	web_long_description=None,
+	ranking=None,
+	published=None,
+	image_base64=None,
+	image_name=None,
+	uoms_json=None,
+	recommended_json=None,
+):
+	"""The edit itself. Ungated so the vendor API can drive it after proving the
+	item belongs to the caller's shop."""
 	item_code = (item_code or "").strip()
 	if not item_code or not frappe.db.exists("Item", item_code):
 		frappe.throw(_("Item not found."), frappe.DoesNotExistError)
@@ -1063,7 +1099,7 @@ def admin_update_item(
 		"ok": True,
 		"image": image_url,
 		"warnings": [],
-		"item": admin_item_payload(item_code),
+		"item": _item_payload(item_code),
 	}
 
 
@@ -1202,7 +1238,42 @@ def admin_create_item(
 	shop. A draft is one flag away in the editor.
 	"""
 	_require_admin()
+	return _create_item(
+		item_code=item_code,
+		item_name=item_name,
+		item_group=item_group,
+		stock_uom=stock_uom,
+		short_description=short_description,
+		web_long_description=web_long_description,
+		ranking=ranking,
+		price_list_rate=price_list_rate,
+		website_warehouse=website_warehouse,
+		image_base64=image_base64,
+		image_name=image_name,
+		uoms_json=uoms_json,
+		recommended_json=recommended_json,
+		published=published,
+	)
 
+
+def _create_item(
+	item_code=None,
+	item_name=None,
+	item_group=None,
+	stock_uom=None,
+	short_description=None,
+	web_long_description=None,
+	ranking=None,
+	price_list_rate=None,
+	website_warehouse=None,
+	image_base64=None,
+	image_name=None,
+	uoms_json=None,
+	recommended_json=None,
+	published=1,
+):
+	"""The creation itself. Ungated so the vendor API can create products for
+	the caller's own shop."""
 	name = strip_html((item_name or "").strip())
 	# The create form no longer asks for a code: the name is the only identifier
 	# an admin has to supply. The code is derived from it here.
