@@ -614,16 +614,33 @@ def webshop_settings():
 	would mean a guest sees a different product page than a signed-in shopper,
 	which is worse than the two booleans being public.
 
-	Only these two switches and the homepage banners leave the server. The rest
-	of `Webshop Settings` (company, price list, shipping account, default
-	delivery rate) is back-office configuration and must never reach a client.
+	Only these switches and the home-page configuration (the shop rail, the
+	advertising banners) leave the server. The rest of `Webshop Settings`
+	(company, price list, shipping account, default delivery rate) is back-office
+	configuration and must never reach a client.
 	"""
 	settings = _settings()
 	return {
 		"enable_reviews": bool(settings.enable_reviews),
 		"enable_recommendations": bool(settings.enable_recommendations),
+		"show_shops_on_homescreen": _show_shops_on_homescreen(settings),
 		"homepage_ads": _homepage_ads(settings),
 	}
+
+
+def _show_shops_on_homescreen(settings=None):
+	"""Whether the app's home screen draws the marketplace shop rail.
+
+	An unset — or, on a site that has not migrated yet, missing — checkbox means
+	"show". Showing the rail is what the home screen did before the setting
+	existed, so a `None` here must not silently empty a section the merchant
+	never turned off.
+	"""
+	settings = settings if settings is not None else _settings()
+	value = settings.get("show_shops_on_homescreen")
+	if value is None:
+		return True
+	return bool(cint(value))
 
 
 def _homepage_ads(settings=None):
