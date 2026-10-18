@@ -607,22 +607,58 @@ def get_group_hierarchy():
 
 @frappe.whitelist(allow_guest=True)
 def webshop_settings():
-	"""The storefront's feature switches, for the mobile app.
+	"""The storefront's public configuration, for the mobile app.
 
 	`allow_guest` on purpose: a product page is public, so whether reviews and
 	recommendations are shown cannot be a privileged read. Making it privileged
 	would mean a guest sees a different product page than a signed-in shopper,
 	which is worse than the two booleans being public.
 
-	Only these two switches leave the server. The rest of `Webshop Settings`
-	(company, price list, shipping account, default delivery rate) is back-office
-	configuration and must never reach a client.
+	Only these two switches and the homepage banners leave the server. The rest
+	of `Webshop Settings` (company, price list, shipping account, default
+	delivery rate) is back-office configuration and must never reach a client.
 	"""
 	settings = _settings()
 	return {
 		"enable_reviews": bool(settings.enable_reviews),
 		"enable_recommendations": bool(settings.enable_recommendations),
+		"homepage_ads": _homepage_ads(settings),
 	}
+
+
+def _homepage_ads(settings=None):
+	"""The merchant's home-hero banners, in the order they were entered.
+
+	Read through `.get()` rather than attribute access so a site that has not
+	migrated yet — where the child table does not exist — answers "no banners"
+	and the app keeps its built-in hero, instead of raising on the home screen.
+
+	`image` goes out as the relative `/files/...` path Frappe stores; the client
+	resolves it against its configured API origin, which is what lets a
+	development build point at one server and production at another.
+	"""
+	settings = settings if settings is not None else _settings()
+	ads = []
+	for row in settings.get("homepage_advertising_images") or []:
+		# A disabled row is a banner the merchant wants to keep for later, so it
+		# is skipped rather than deleted. A row with no image is dropped too:
+		# `image` is mandatory in the form, but an import or a direct write can
+		# still produce one, and a banner with nothing to draw is dead space.
+		if not cint(row.get("enabled", 1)):
+			continue
+		image = (row.get("image") or "").strip()
+		if not image:
+			continue
+		ads.append(
+			{
+				"image": image,
+				"title": row.get("title") or "",
+				"item_group": row.get("item_group") or "",
+				"item_code": row.get("item_code") or "",
+				"url": row.get("url") or "",
+			}
+		)
+	return ads
 
 
 def _storefront_recommended(item_doc):
