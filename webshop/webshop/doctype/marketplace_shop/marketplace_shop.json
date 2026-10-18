@@ -1,0 +1,198 @@
+{
+ "actions": [],
+ "autoname": "format:SHOP-{#####}",
+ "creation": "2026-10-17 09:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "shop_name",
+  "status",
+  "column_break_shop",
+  "logo",
+  "presentation_section",
+  "description",
+  "ownership_section",
+  "vendor_user",
+  "supplier",
+  "is_platform",
+  "commercial_section",
+  "commission_rate",
+  "delivery_rate",
+  "payout_section",
+  "bank_name",
+  "column_break_payout",
+  "account_holder",
+  "account_number",
+  "approval_section",
+  "approved_by",
+  "approved_on",
+  "rejection_reason"
+ ],
+ "fields": [
+  {
+   "fieldname": "shop_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Shop Name",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "default": "Pending",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Status",
+   "options": "Pending\nApproved\nSuspended\nRejected",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_shop",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Shown on the vendor's storefront page and on every product card.",
+   "fieldname": "logo",
+   "fieldtype": "Attach Image",
+   "label": "Logo"
+  },
+  {
+   "fieldname": "presentation_section",
+   "fieldtype": "Section Break",
+   "label": "Presentation"
+  },
+  {
+   "fieldname": "description",
+   "fieldtype": "Small Text",
+   "label": "Description"
+  },
+  {
+   "fieldname": "ownership_section",
+   "fieldtype": "Section Break",
+   "label": "Ownership"
+  },
+  {
+   "description": "The portal account that manages this shop from the mobile app. One account owns at most one shop.",
+   "fieldname": "vendor_user",
+   "fieldtype": "Link",
+   "label": "Vendor User",
+   "options": "User"
+  },
+  {
+   "description": "Created automatically when the shop is approved. Used for settlement documents.",
+   "fieldname": "supplier",
+   "fieldtype": "Link",
+   "label": "Supplier",
+   "options": "Supplier",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "description": "The platform's own shop: products not assigned to a vendor belong here. Cannot be deleted.",
+   "fieldname": "is_platform",
+   "fieldtype": "Check",
+   "label": "Is Platform",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "commercial_section",
+   "fieldtype": "Section Break",
+   "label": "Commercial Terms"
+  },
+  {
+   "description": "Platform commission on this shop's sales. Leave blank to use the shop-wide default from Webshop Settings.",
+   "fieldname": "commission_rate",
+   "fieldtype": "Percent",
+   "label": "Commission Rate"
+  },
+  {
+   "description": "Delivery fee this shop charges per order. Leave blank to fall back to the address/shop-wide delivery charge.",
+   "fieldname": "delivery_rate",
+   "fieldtype": "Currency",
+   "label": "Delivery Rate"
+  },
+  {
+   "fieldname": "payout_section",
+   "fieldtype": "Section Break",
+   "label": "Payout Details"
+  },
+  {
+   "fieldname": "bank_name",
+   "fieldtype": "Data",
+   "label": "Bank Name"
+  },
+  {
+   "fieldname": "column_break_payout",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "account_holder",
+   "fieldtype": "Data",
+   "label": "Account Holder"
+  },
+  {
+   "fieldname": "account_number",
+   "fieldtype": "Data",
+   "label": "Account Number"
+  },
+  {
+   "fieldname": "approval_section",
+   "fieldtype": "Section Break",
+   "label": "Approval"
+  },
+  {
+   "fieldname": "approved_by",
+   "fieldtype": "Link",
+   "label": "Approved By",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "approved_on",
+   "fieldtype": "Date",
+   "label": "Approved On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "rejection_reason",
+   "fieldtype": "Small Text",
+   "label": "Rejection Reason"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-10-17 09:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Webshop",
+ "name": "Marketplace Shop",
+ "naming_rule": "Expression",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Marketplace Vendor",
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

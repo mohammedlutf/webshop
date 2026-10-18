@@ -1,0 +1,75 @@
+{
+ "actions": [],
+ "creation": "2026-10-18 09:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "image",
+  "title",
+  "enabled",
+  "column_break_targets",
+  "item_group",
+  "item_code",
+  "url"
+ ],
+ "fields": [
+  {
+   "fieldname": "image",
+   "fieldtype": "Attach Image",
+   "in_list_view": 1,
+   "label": "Image",
+   "reqd": 1
+  },
+  {
+   "description": "Read out to screen readers, and used as the banner's alternative text.",
+   "fieldname": "title",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Title"
+  },
+  {
+   "default": "1",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Enabled"
+  },
+  {
+   "fieldname": "column_break_targets",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Optional. Tapping the banner opens this category's products.",
+   "fieldname": "item_group",
+   "fieldtype": "Link",
+   "label": "Opens item group",
+   "options": "Item Group"
+  },
+  {
+   "description": "Optional. Tapping the banner opens this product. Takes precedence over the item group.",
+   "fieldname": "item_code",
+   "fieldtype": "Link",
+   "label": "Opens product",
+   "options": "Item"
+  },
+  {
+   "description": "Optional. An external link (https://...), used only when neither a product nor an item group is set.",
+   "fieldname": "url",
+   "fieldtype": "Data",
+   "label": "Opens URL"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-10-18 09:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Webshop",
+ "name": "Homepage Advertising Image",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
