@@ -1,0 +1,7 @@
+line1
+		
+عربي
+— dash
+world   
+    
+end

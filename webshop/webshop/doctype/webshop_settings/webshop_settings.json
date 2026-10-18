@@ -60,6 +60,8 @@
   "delivery_charges_section",
   "shipping_account",
   "default_delivery_rate",
+  "marketplace_section",
+  "default_commission_rate",
   "admin_users_section",
   "admin_users"
  ],
@@ -404,6 +406,17 @@
    "fieldname": "default_delivery_rate",
    "fieldtype": "Currency",
    "label": "Default delivery rate"
+  },
+  {
+   "fieldname": "marketplace_section",
+   "fieldtype": "Section Break",
+   "label": "Marketplace"
+  },
+  {
+   "description": "Platform commission applied to every vendor shop's sales that has no rate of its own. Snapshotted onto each order at checkout.",
+   "fieldname": "default_commission_rate",
+   "fieldtype": "Percent",
+   "label": "Default commission rate"
   },
   {
    "fieldname": "admin_users_section",
