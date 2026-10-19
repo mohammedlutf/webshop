@@ -6,6 +6,13 @@
  "engine": "InnoDB",
  "field_order": [
   "offer_title",
+  "uom",
+  "original_price",
+  "show_offer_title",
+  "column_break_offer_flags",
+  "show_discount_percent",
+  "title_before_discount",
+  "is_wholesale",
   "offer_subtitle",
   "offer_details"
  ],
@@ -17,9 +24,56 @@
    "label": "Offer Title"
   },
   {
+   "description": "Leave empty to apply the offer to every UOM of this product.",
+   "fieldname": "uom",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "UOM",
+   "options": "UOM"
+  },
+  {
+   "description": "The price before the offer. The discount percentage is worked out against this UOM's own selling price.",
+   "fieldname": "original_price",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Original Price"
+  },
+  {
+   "default": "1",
+   "description": "Show the offer title next to the discount on the storefront.",
+   "fieldname": "show_offer_title",
+   "fieldtype": "Check",
+   "label": "Show Offer Title"
+  },
+  {
+   "fieldname": "column_break_offer_flags",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "1",
+   "description": "Show the discount percentage (needs an Original Price above the selling price).",
+   "fieldname": "show_discount_percent",
+   "fieldtype": "Check",
+   "label": "Show Discount Percent"
+  },
+  {
+   "default": "0",
+   "description": "Draw the offer title before the discount percentage (to its right, in Arabic).",
+   "fieldname": "title_before_discount",
+   "fieldtype": "Check",
+   "label": "Title Before Discount"
+  },
+  {
+   "default": "0",
+   "description": "This UOM's price is a wholesale (bulk) price: show the wholesale label. Leave unticked to let the site work it out from the price and the conversion factor.",
+   "fieldname": "is_wholesale",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Wholesale Price"
+  },
+  {
    "fieldname": "offer_subtitle",
    "fieldtype": "Data",
-   "in_list_view": 1,
    "label": "Offer Subtitle"
   },
   {
@@ -31,7 +85,7 @@
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2021-04-21 13:56:04.660331",
+ "modified": "2026-10-19 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "Webshop",
  "name": "Website Offer",

@@ -125,6 +125,12 @@ def _save_cart(items):
 # bound parameters) well inside MySQL's limits even for a large wishlist.
 _SQL_CHUNK = 400
 
+# A wholesale price is one that undercuts the stock UOM price scaled by the
+# UOM's own conversion factor: the merchant priced that pack on its own instead
+# of leaving the price to the linear conversion. The epsilon keeps a price that
+# is arithmetically equal (but stored with a rounding tail) out of the label.
+_WHOLESALE_EPS = 0.01
+
 
 def _build_uom_list(stock_uom, conversion_factors, raw_prices):
 	"""One item's UOM list from already-fetched rows.
@@ -143,13 +149,20 @@ def _build_uom_list(stock_uom, conversion_factors, raw_prices):
 			continue
 		seen.add(uom_name)
 		if uom_name in price_map:
-			uoms_list.append(price_map[uom_name])
+			entry = dict(price_map[uom_name])
+			conv_factor = flt(conversion_factors.get(uom_name) or 1.0) or 1.0
+			entry["conversion_factor"] = conv_factor
+			entry["package"] = f"في {uom_name} {conv_factor} {stock_uom}"
+			uoms_list.append(entry)
+			
+			
 		elif base_price_doc:
 			conv_factor = flt(conversion_factors.get(uom_name) or 1.0) or 1.0
 			uoms_list.append({
 				"uom": uom_name,
 				"price_list_rate": flt(base_price_doc["price_list_rate"]) * conv_factor,
 				"currency": base_price_doc["currency"],
+				"conversion_factor": conv_factor,
 				"package": f"في {uom_name} {conv_factor} {stock_uom}",
 			})
 		else:
@@ -158,6 +171,7 @@ def _build_uom_list(stock_uom, conversion_factors, raw_prices):
 				"uom": uom_name,
 				"price_list_rate": 0,
 				"currency": "",
+				"conversion_factor": flt(conversion_factors.get(uom_name) or 1.0) or 1.0,
 			})
 
 	# Final safeguard: if uoms_list is completely empty, force stock_uom
@@ -166,9 +180,44 @@ def _build_uom_list(stock_uom, conversion_factors, raw_prices):
 			"uom": stock_uom,
 			"price_list_rate": flt(base_price_doc["price_list_rate"]) if base_price_doc else 0,
 			"currency": base_price_doc["currency"] if base_price_doc else "",
+			"conversion_factor": 1.0,
 		})
 
 	return uoms_list
+
+
+def _mark_wholesale(uoms, enabled=True):
+	"""Flag the UOM prices that are wholesale rather than plain conversions.
+
+	The rule the merchant asked for: a UOM whose conversion factor is greater
+	than the stock UOM's is a *pack* (a carton, a sack). When its price is below
+	stock price x conversion factor the price was set for that pack and buying
+	the pack is cheaper than buying the same quantity in the stock UOM, which is
+	what wholesaling means here. An equal or higher price is just the linear
+	conversion and nothing is shown.
+
+	`enabled` is the per-item switch on the Website Item, so an item whose packs
+	are cheaper for an unrelated reason can opt out. The stock UOM is never
+	wholesale; a UOM smaller than the stock UOM (factor below 1) is a division,
+	not a bulk pack.
+	"""
+	if not uoms:
+		return uoms
+
+	base = flt(uoms[0].get("price_list_rate"))
+	base_uom = uoms[0].get("uom")
+
+	for entry in uoms:
+		entry["is_wholesale"] = False
+		if not enabled or not base or entry.get("uom") == base_uom:
+			continue
+		factor = flt(entry.get("conversion_factor") or 1.0) or 1.0
+		if factor <= 1:
+			continue
+		if flt(entry.get("price_list_rate")) < (base * factor) - _WHOLESALE_EPS:
+			entry["is_wholesale"] = True
+
+	return uoms
 
 
 def _uom_prices_for_items(item_codes):
@@ -359,29 +408,135 @@ def _item_fields():
 
 	`blurhash` is appended only when the site has the custom field, so a bench
 	that has not added it yet keeps working instead of failing on an unknown
-	column. See OVERHAUL_PLAN.md for the field definition and the backfill.
+	column. See OVERHAUL_PLAN.md for the field definition and the backfill. The
+	two offers switches are guarded the same way, for the window between
+	deploying the code and running the migration.
 	"""
 	fields = [
 		"name", "item_code", "web_item_name", "item_name", "item_group", "route",
 		"website_image", "thumbnail", "short_description", "description",
 		"web_long_description", "stock_uom", "website_warehouse", "ranking", "on_backorder",
 	]
-	if frappe.get_meta("Website Item").has_field("blurhash"):
+	meta = frappe.get_meta("Website Item")
+	if meta.has_field("blurhash"):
 		fields.append("blurhash")
-	if frappe.get_meta("Website Item").has_field("marketplace_shop"):
+	if meta.has_field("marketplace_shop"):
 		fields.append("marketplace_shop")
+	if meta.has_field("auto_wholesale_detection"):
+		fields.append("auto_wholesale_detection")
+	if meta.has_field("wholesale_label"):
+		fields.append("wholesale_label")
 	return fields
 
 
-def _decorate(item, uoms=None):
+# Offer columns the storefront reads. The first four always exist; the rest
+# arrived with the per-UOM offer work, so they are selected only when the child
+# doctype carries them (`_offer_fields`).
+_OFFER_FIELDS = (
+	"uom",
+	"original_price",
+	"show_offer_title",
+	"show_discount_percent",
+	"title_before_discount",
+	"is_wholesale",
+)
+
+
+def _offer_fields():
+	"""`Website Offer` columns to select, schema-tolerant.
+
+	`_public_offers` defaults every flag that is missing, so a bench that has
+	not migrated the child table yet keeps showing offer titles (the old
+	behaviour) instead of breaking on an unknown column.
+	"""
+	meta = frappe.get_meta("Website Offer")
+	fields = ["parent", "idx", "offer_title", "offer_subtitle", "offer_details"]
+	fields.extend(fieldname for fieldname in _OFFER_FIELDS if meta.has_field(fieldname))
+	return fields
+
+
+def _public_offers(rows):
+	"""Offer rows in the shape the storefront reads.
+
+	Defaults repeat the child doctype's own defaults, so a row that predates the
+	flags keeps its title and discount badge.
+	"""
+	offers = []
+	for row in rows or []:
+		offers.append({
+			"uom": (row.get("uom") or "").strip(),
+			"offer_title": row.get("offer_title") or "",
+			"offer_subtitle": row.get("offer_subtitle") or "",
+			"offer_details": row.get("offer_details") or "",
+			"original_price": flt(row.get("original_price")),
+			"show_offer_title": row.get("show_offer_title") is None or bool(cint(row.get("show_offer_title"))),
+			"show_discount_percent": (
+				row.get("show_discount_percent") is None or bool(cint(row.get("show_discount_percent")))
+			),
+			"title_before_discount": bool(cint(row.get("title_before_discount"))),
+			"is_wholesale": bool(cint(row.get("is_wholesale"))),
+		})
+	return offers
+
+
+def _offers_for_items(website_item_names):
+	"""Offer rows for a whole page of items, in one extra query.
+
+	`offers` is a child table and therefore cannot ride along in
+	`_item_fields()`; this batched read is what keeps a catalogue page at one
+	query instead of one per product. Returns `{website_item_name: [offer]}` for
+	every name asked for (empty list when the item has no offers).
+	"""
+	names = [name for name in dict.fromkeys(website_item_names or []) if name]
+	if not names:
+		return {}
+
+	by_parent = {}
+	for start in range(0, len(names), _SQL_CHUNK):
+		chunk = names[start : start + _SQL_CHUNK]
+		for row in frappe.get_all(
+			"Website Offer",
+			filters={"parenttype": "Website Item", "parent": ["in", chunk]},
+			fields=_offer_fields(),
+			# `idx asc` keeps the merchant's own row order.
+			order_by="parent asc, idx asc",
+			limit_page_length=0,
+		):
+			by_parent.setdefault(row.parent, []).append(row)
+
+	return {name: _public_offers(by_parent.get(name)) for name in names}
+
+
+def _auto_wholesale_enabled(item):
+	"""The item's "Detect Wholesale Prices" switch, on unless turned off.
+
+	A missing value (a site that has not migrated the field in yet) counts as
+	ON, which is what the doctype's own default says.
+	"""
+	value = item.get("auto_wholesale_detection") if hasattr(item, "get") else None
+	if value is None:
+		return True
+	return bool(cint(value))
+
+
+def _decorate(item, uoms=None, offers=None):
 	if uoms is None:
 		uoms = _get_calculated_uoms(item.item_code)
 	price = uoms[0] if uoms else {"price_list_rate": 0, "currency": ""}
 	item.image = item.website_image or item.thumbnail or ""
 	item.price = flt(price.get("price_list_rate", 0))
 	item.currency = price.get("currency", "")
-	item.uoms = uoms
+	# Copied before flagging: the UOM lists are shared between the rows of one
+	# request (the same item can back more than one Website Item), and a copy
+	# keeps one item's wholesale switch from leaking onto another's payload.
+	item.uoms = _mark_wholesale([dict(u) for u in uoms], _auto_wholesale_enabled(item))
 	item.in_stock = bool(item.on_backorder or item.website_warehouse)
+	# The offer rows drive the discount badge, the struck-through original price
+	# and the offer title on both the product page and the cards.
+	item.offers = _public_offers(offers)
+	# The merchant may word the wholesale label their own way; the app falls back
+	# to «السعر بالجمله» when this is empty.
+	item.wholesale_label = item.get("wholesale_label") or ""
 	# The owning shop travels with every catalogue row: cards show the badge and
 	# checkout splits the cart by it. No-op (shop = None) before the migration.
 	mp.decorate_with_shop(item)
@@ -406,6 +561,22 @@ def _website_groups():
 	return cached
 
 
+def _cross_listed_names(group):
+	"""Website Items that list `group` in their own Website Item Groups table.
+
+	A product is published into extra groups without moving its own Item Group,
+	so a group listing has to look in the child table as well as at the
+	`item_group` column. Returns Website Item names, in a stable order and
+	deduplicated.
+	"""
+	return list(dict.fromkeys(frappe.get_all(
+		"Website Item Group",
+		filters={"parenttype": "Website Item", "item_group": group},
+		pluck="parent",
+		limit_page_length=0,
+	)))
+
+
 def _catalog_filters(item_group=None, search=None, shop=None):
 	allowed_groups = _website_groups()
 
@@ -415,7 +586,29 @@ def _catalog_filters(item_group=None, search=None, shop=None):
 	group = (item_group or "").strip()
 	if group:
 		if group in allowed_groups:
-			filters["item_group"] = group
+			cross_listed = _cross_listed_names(group)
+			if not cross_listed:
+				filters["item_group"] = group
+			elif not search:
+				# `item_group = group OR name in (cross-listed)`. `or_filters` is
+				# AND-ed with `filters` as a single parenthesised group, which is
+				# exactly the shape this needs.
+				or_filters = [{"item_group": group}, {"name": ["in", cross_listed]}]
+			else:
+				# A search is *also* an OR group (any searchable field may
+				# match), and `or_filters` can only contribute one OR group to
+				# the query. Resolving the inclusive half to explicit names keeps
+				# `search AND (group OR cross-listed)` correct instead of turning
+				# it into `(search OR cross-listed) AND group`. Browsing a group
+				# and searching in the same request is not a path the app takes,
+				# so this is the correctness path, not the hot one.
+				direct = frappe.get_all(
+					"Website Item",
+					filters={"item_group": group},
+					pluck="name",
+					limit_page_length=0,
+				)
+				filters["name"] = ["in", list(dict.fromkeys(direct + cross_listed))]
 		else:
 			# A website-hidden group must not become readable just because a
 			# client named it in a query string. An empty page is the honest
@@ -475,7 +668,12 @@ def get_catalog(item_group=None, search=None, limit=24, start=0, shop=None):
 	)
 	# One batched UOM/price resolution for the whole page (was: per row).
 	uom_map = _uom_prices_for_items([row.item_code for row in items])
-	return [_decorate(item, uom_map.get(item.item_code)) for item in items]
+	# And one batched offers read for the same page.
+	offers_map = _offers_for_items([row.name for row in items])
+	return [
+		_decorate(item, uom_map.get(item.item_code), offers_map.get(item.name))
+		for item in items
+	]
 
 
 def get_catalog_count(item_group=None, search=None, shop=None):
@@ -765,7 +963,20 @@ def get_item(route=None, item_code=None):
 
 	item_doc = frappe.get_doc("Website Item", item.name)
 	item.recommended_items = _storefront_recommended(item_doc)
-	item.offers = item_doc.offers or []
+	# The offer rows as the storefront reads them, taken straight off the
+	# document this page already loads — no second query for a single product.
+	item.offers = _public_offers(item_doc.offers)
+	# The extra groups this product is cross-listed into. The group listings
+	# already include the product (see `_cross_listed_names`); this is what lets
+	# the product page say which groups it appears in. Restricted to groups the
+	# storefront actually lists — a chip that opens an empty page would be worse
+	# than no chip at all.
+	allowed_groups = set(_website_groups())
+	item.website_item_groups = [
+		row.item_group
+		for row in (item_doc.website_item_groups or [])
+		if row.item_group and row.item_group in allowed_groups
+	]
 	item.reviews = frappe.get_all(
 		"Item Review", filters={"website_item": item.name},
 		fields=["user", "rating", "review_title", "comment", "published_on", "creation"],
@@ -809,6 +1020,9 @@ def _wishlist_items():
 			details.setdefault(row.item_code, row)
 
 	uom_map = _uom_prices_for_items([r.item_code for r in records if r.get("item_code")])
+	# Same batched offers read as the catalogue: the wishlist renders the same
+	# cards, so it needs the same offer badges.
+	offers_map = _offers_for_items([row.name for row in details.values()])
 	hide_zero_rate = _hide_zero_rate_enabled()
 
 	items = []
@@ -825,6 +1039,7 @@ def _wishlist_items():
 		item = _decorate(
 			frappe._dict({**record, **dict(detail)}),
 			uom_map.get(record.get("item_code")),
+			offers_map.get(detail.name),
 		)
 		# The product page's zero-rate rule applies here too, since the same
 		# `get_item` used to enforce it on every wishlist row.

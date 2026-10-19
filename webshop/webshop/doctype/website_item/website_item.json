@@ -44,6 +44,9 @@
   "recommended_items_section",
   "recommended_items",
   "offers_section",
+  "auto_wholesale_detection",
+  "column_break_offers",
+  "wholesale_label",
   "offers",
   "section_break_6",
   "ranking",
@@ -299,6 +302,23 @@
    "label": "Offers"
   },
   {
+   "default": "1",
+   "description": "Label a UOM as wholesale when its price is set below the stock UOM price times its conversion factor (i.e. a bulk pack priced cheaper than the linear price).",
+   "fieldname": "auto_wholesale_detection",
+   "fieldtype": "Check",
+   "label": "Detect Wholesale Prices"
+  },
+  {
+   "fieldname": "column_break_offers",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Text shown for a wholesale price. Leave empty to use السعر بالجمله.",
+   "fieldname": "wholesale_label",
+   "fieldtype": "Data",
+   "label": "Wholesale Label"
+  },
+  {
    "fieldname": "offers",
    "fieldtype": "Table",
    "label": "Offers to Display",
@@ -355,7 +375,7 @@
  "index_web_pages_for_search": 1,
  "links": [],
  "make_attachments_public": 1,
- "modified": "2026-10-12 18:41:21.667504",
+ "modified": "2026-10-19 10:05:00.000000",
  "modified_by": "Administrator",
  "module": "Webshop",
  "name": "Website Item",
