@@ -480,7 +480,7 @@ def _save_item_image(item_code, file_base64, file_name=None):
 	website_item = frappe.db.get_value("Website Item", {"item_code": item_code}, "name")
 	previous = frappe.db.get_value("Website Item", website_item, "website_image") if website_item else None
 
-	stem = slugify((file_name or "").rsplit(".", 1)[0]) or _custom_slugify(item_code)
+	stem = slugify((file_name or "").rsplit(".", 1)[0]) or slugify(item_code)
 	filename = f"{stem}-{frappe.generate_hash(length=8)}.{extension}"
 
 	# Call save_file imported from frappe.utils.file_manager
