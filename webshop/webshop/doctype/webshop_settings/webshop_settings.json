@@ -47,6 +47,10 @@
   "enable_reviews",
   "column_break_23",
   "enable_recommendations",
+  "cart_restriction_section",
+  "disable_add_to_cart_web",
+  "column_break_cart_restrict",
+  "disable_add_to_cart_app",
   "item_search_settings_section",
   "redisearch_warning",
   "search_index_fields",
@@ -365,6 +369,27 @@
    "fieldname": "enable_recommendations",
    "fieldtype": "Check",
    "label": "Enable Recommendations"
+  },
+  {
+   "fieldname": "cart_restriction_section",
+   "fieldtype": "Section Break",
+   "label": "Cart Restriction"
+  },
+  {
+   "default": "0",
+   "fieldname": "disable_add_to_cart_web",
+   "fieldtype": "Check",
+   "label": "Disable Add to Cart in Website"
+  },
+  {
+   "fieldname": "column_break_cart_restrict",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "disable_add_to_cart_app",
+   "fieldtype": "Check",
+   "label": "Disable Add to Cart in Apps (iOS and Android)"
   },
   {
    "default": "0",
