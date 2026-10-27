@@ -1098,7 +1098,7 @@ def wishlist_items():
 @frappe.whitelist(allow_guest=True)
 def cart(item_code=None, qty=0, uom=None):
 	settings = _settings()
-	print(settings.get("disable_add_to_cart_web"))
+	
 	if item_code:
 		if settings.get("disable_add_to_cart_web") or settings.get("disable_add_to_cart_app"):
 			frappe.throw(_("سيتم إضافته قريبًا"))
